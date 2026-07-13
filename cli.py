@@ -34,7 +34,7 @@ def print_projects(settings: Settings) -> None:
         default = " (default)" if project.name in settings.default_projects else ""
         description = f" — {project.description}" if project.description else ""
         print(f"{project.name}{default}{description}")
-        print(f"  {project.directory}")
+        print(f"  AWS service profile: {project.service_name}")
 
 
 def print_dry_run(
@@ -129,7 +129,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.action == "refresh-project":
         try:
-            LOG.info("Service credentials refreshed for %s", refresh_project_credentials(projects[0]))
+            LOG.info(
+                "Service credentials refreshed for %s",
+                refresh_project_credentials(settings, projects[0]),
+            )
             return 0
         except Exception as error:  # project scripts have historical variants
             LOG.exception("Unable to refresh project %s: %s", projects[0].name, error)

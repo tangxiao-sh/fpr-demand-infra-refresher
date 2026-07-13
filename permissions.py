@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import configparser
 from pathlib import Path
-import runpy
 import shlex
 import subprocess
+import sys
 import time
 from typing import Any, Sequence
 
 from config import ProjectConfig, RoleConfig, Settings
+from credentials import refresh_service_credentials
 
 
 LOG = logging.getLogger("accessor.permissions")
@@ -184,62 +184,16 @@ class RoleRefresher:
         return False
 
 
-def refresh_project_credentials(project: ProjectConfig) -> str:
-    """Reuse a proxy module's credential functions without starting sshuttle.
-
-    The project script is run under a non-``__main__`` name, so its bottom main
-    block never executes. This is the important separation: rotating service
-    credentials does not recreate or disturb an established sshuttle tunnel.
-    """
-    namespace = runpy.run_path(
-        str(project.script_path), run_name="accessor_project_proxy_module"
-    )
-    required = ("boto3", "aws_profile", "service_name", "get_credential", "write_credential")
-    missing = [name for name in required if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            f"project {project.name}: proxy script is missing expected symbols: {', '.join(missing)}"
-        )
-
-    # New scripts usually obtain the region from AWS_REGION; old ones expose a
-    # `region` global. Their original default is ap-southeast-1.
-    region = namespace.get("region") or os.environ.get("AWS_REGION", "ap-southeast-1")
-    namespace["boto3"].setup_default_session(
-        profile_name=namespace["aws_profile"], region_name=region
-    )
-
-    arguments: list[Any] = []
-    for parameter in inspect.signature(namespace["get_credential"]).parameters.values():
-        if parameter.kind not in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            raise RuntimeError(f"project {project.name}: unsupported parameter {parameter.name}")
-        if parameter.name == "session_name" and "read_aws_config" in namespace:
-            arguments.append(namespace["read_aws_config"](profile_name=namespace["aws_profile"]))
-        elif parameter.name in namespace:
-            arguments.append(namespace[parameter.name])
-        elif parameter.default is inspect.Parameter.empty:
-            raise RuntimeError(
-                f"project {project.name}: cannot resolve parameter {parameter.name}"
-            )
-
-    credential = namespace["get_credential"](*arguments)
-    service_name = namespace["service_name"]
-    # Preserve the project's own ~/.aws/credentials writing behavior. Secrets
-    # are never logged or stored by Accessor outside that existing writer.
-    namespace["write_credential"](service_name, credential)
-    return service_name
+def refresh_project_credentials(settings: Settings, project: ProjectConfig) -> str:
+    """Refresh a service profile using Accessor's standalone AWS implementation."""
+    return refresh_service_credentials(settings, project)
 
 
 def check_project_credentials(project: ProjectConfig) -> tuple[bool, str]:
     """Check the existing service profile without writing credentials or starting proxy."""
-    namespace = runpy.run_path(
-        str(project.script_path), run_name="accessor_project_proxy_check"
-    )
-    service_name = namespace.get("service_name")
-    if not isinstance(service_name, str) or not service_name:
-        return False, "proxy script has no service_name"
+    service_name = project.service_name
+    if not service_name:
+        return False, "project has no service_name"
     try:
         result = subprocess.run(
             ["aws", "sts", "get-caller-identity", "--profile", service_name],
@@ -257,9 +211,9 @@ def check_project_credentials(project: ProjectConfig) -> tuple[bool, str]:
 def run_project_refresh(
     settings: Settings, project: ProjectConfig, dry_run: bool = False
 ) -> bool:
-    """Run a project refresh using that project's Python interpreter."""
+    """Run Accessor's standalone service refresh in an isolated child process."""
     command = (
-        project.python,
+        sys.executable,
         str(Path(__file__).with_name("cli.py")),
         "refresh-project",
         "--config",
@@ -272,14 +226,14 @@ def run_project_refresh(
         LOG.info("Would execute: %s", shlex.join(command))
         return True
     try:
-        # Scheduler refreshes run in the background. Keep project-script output
-        # out of the interactive menu; failures remain visible in this log.
+        # Scheduler refreshes run in the background. Keep boto3 output out of
+        # the interactive menu; failures remain visible in this log.
         with CREDENTIAL_REFRESH_LOG.open("a", encoding="utf-8") as log_file:
             result = subprocess.run(
                 command,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                # Project scripts normally complete in seconds.  Do not let
+                # AWS service discovery normally completes in seconds. Do not let
                 # one stalled service call monopolize the serialized worker
                 # for the five-minute Granted command timeout.
                 timeout=settings.project_command_timeout_seconds,

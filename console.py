@@ -348,8 +348,8 @@ class AccessorConsole:
                 self._update_refresh_status("project", project.name, "有效" if ready else "刷新失败")
             return
 
-        # The Demand Proxy is a shared connection. The connector script is an
-        # implementation detail selected from default_proxy, not a project owner.
+        # The Demand Proxy is a shared connection. The configured service target
+        # is only used for its AWS mapping, not as a project owner.
         connector = self.settings.projects_by_name.get(self.settings.default_proxy or "")
         if connector is None:
             if self._ui_active:

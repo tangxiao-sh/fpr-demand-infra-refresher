@@ -1,18 +1,19 @@
 # Accessor CLI
 
-Accessor keeps selected development AWS roles and project service credentials
-ready. It reuses each project's existing `establish_proxy_connection.py` rather
-than reimplementing AWS role assumption or sshuttle setup.
+Accessor keeps selected development AWS roles and service credentials ready.
+It contains its own AWS role-discovery, credential-rotation, Demand Proxy, and
+sshuttle implementation. The business repositories that were used as reference
+are not imported or executed at runtime; they can be absent from the machine.
 
-One Accessor process can refresh credentials for multiple projects. It starts at
-most one sshuttle connection: project proxy scripts install overlapping routes,
-so multiple simultaneous tunnels would conflict. Credentials refresh on their
-own schedule; sshuttle is only checked every five minutes and restarted if dead.
+One Accessor process can refresh credentials for multiple service targets. It
+starts at most one sshuttle connection because the shared Demand Proxy routes
+overlap. Credentials refresh on their own schedule; sshuttle is only checked
+every five minutes and restarted if dead.
 
 ## Commands
 
 ```bash
-cd /Users/tang.xiao/IdeaProjects/tool/Accessor
+cd Accessor
 ./accessor
 ```
 
@@ -56,29 +57,32 @@ you only need build/writelock credentials or already have a tunnel running.
 ```
 
 `refresh` performs one role and service-credential refresh, then exits.
-`check` is local-only: it verifies paths, commands, and `boto3` without calling
-AWS. `--dry-run` prints the planned external commands without changing state.
+`check` verifies Accessor's own commands and boto3 without calling AWS.
+`--dry-run` prints the planned external commands without changing state.
 
-## Add or switch projects
+## Add or switch service targets
 
-Add another `[[projects]]` block to [accessor.toml](/Users/tang.xiao/IdeaProjects/tool/Accessor/accessor.toml:31):
+Add another `[[projects]]` block to `accessor.toml`; no local checkout path or
+Proxy script is needed:
 
 ```toml
 [[projects]]
 name = "fprbpf"
-description = "my local fprbpf checkout"
-directory = "/Users/tang.xiao/IdeaProjects/fpr-fprbpf"
+description = "fprbpf service credentials"
+service_name = "fprbpf"
+ec2_cluster_tag = "fprbpf-app"
 depends_on_role = "local-staging-jump"
 ```
 
-The script and Python defaults are the usual proxy-script values, so they can be
-omitted. Use `default_projects` and `default_proxy` to choose what `./accessor run`
-does when no project flag is supplied.
+`service_name` is the AWS profile written to `~/.aws/credentials`.
+`ec2_cluster_tag`, `discovery_tag`, and `discovery_value` describe where the
+service IAM role is found. Use `default_projects` and `default_proxy` to choose
+what `./accessor run` does when no project flag is supplied.
 
 ## Permission and proxy behavior
 
 Every 10 minutes, Accessor runs `aws sts get-caller-identity --profile ...`; this
-invokes the existing Granted `credential_process`. If a role is unavailable, it
+invokes the configured Granted `credential_process`. If a role is unavailable, it
 foreground refresh runs `assume --wait PROFILE` for that exact profile, then
 checks it again through your interactive zsh shell, so the existing Granted
 alias in `.zshenv` is used. Background refreshes remain quiet and only update menu status;
@@ -86,13 +90,13 @@ use `检查` followed by `开启 / 刷新` to approve an expired entitlement. Us
 `--no-auto-request` if you want to see failures without requesting access.
 
 The initial Granted approval and terminal sudo preparation can still require
-interaction. On `Ctrl-C`, Accessor stops the project script plus its shell and
-sshuttle children.
+interaction. On `Ctrl-C`, Accessor stops its sshuttle process and children.
 
-After the terminal sudo preparation finishes, the project proxy runs in its own
-session and writes output to `/tmp/accessor-demand-proxy.log`; it does not take
-over the interactive Accessor console. Use `tail -f /tmp/accessor-demand-proxy.log`
-when you need to inspect proxy output.
+After the terminal sudo preparation finishes, Accessor resolves the shared
+Demand Proxy instance from the configured SSM parameter and starts sshuttle in
+its own session. Output is written to `/tmp/accessor-demand-proxy.log`; it does
+not take over the interactive Accessor console. Use `tail -f
+/tmp/accessor-demand-proxy.log` when you need to inspect proxy output.
 
 Background service-credential refresh output is similarly written to
 `/tmp/accessor-credential-refresh.log`, keeping the status menu usable.
@@ -109,15 +113,16 @@ this sequence.
 
 ## Code layout
 
-- [cli.py](/Users/tang.xiao/IdeaProjects/tool/Accessor/cli.py): argument parsing and one-off commands.
-- [scheduler.py](/Users/tang.xiao/IdeaProjects/tool/Accessor/scheduler.py): independent timed loops for roles, credentials, and liveness checks.
-- [permissions.py](/Users/tang.xiao/IdeaProjects/tool/Accessor/permissions.py): Granted/AWS role requests and service credential rotation.
-- [sshuttle.py](/Users/tang.xiao/IdeaProjects/tool/Accessor/sshuttle.py): start, long-interval liveness state, and cleanup of sshuttle.
-- [config.py](/Users/tang.xiao/IdeaProjects/tool/Accessor/config.py): TOML loading, models, and local validation.
+- [cli.py](cli.py): argument parsing and one-off commands.
+- [scheduler.py](scheduler.py): independent timed loops for roles, credentials, and liveness checks.
+- [permissions.py](permissions.py): Granted/AWS role requests and service credential rotation.
+- [credentials.py](credentials.py): standalone service-role discovery and credential writing.
+- [sshuttle.py](sshuttle.py): start, long-interval liveness state, and cleanup of sshuttle.
+- [config.py](config.py): TOML loading, models, and local validation.
 
-Python 3.11+ and `boto3` in each configured project's Python environment are
-required. Accessor never prints credentials or creates another credential store;
-it delegates the final write to the project's existing `write_credential`.
+Python 3.11+ and `boto3` in Accessor's own environment are required. Accessor
+never prints credentials or creates another credential store; it writes the
+temporary service profiles to the standard `~/.aws/credentials` file.
 # Accessor
 
 `./accessor` uses the project-local `.venv` and launches a `prompt_toolkit`

@@ -84,10 +84,10 @@ class RefreshScheduler:
         self.next_sshuttle_check = 0.0
         self.stop_requested = False
         self.lock_conflict_message: str | None = None
-        # A project proxy module can spend minutes waiting for AWS.  Keep that
+        # AWS service discovery can spend minutes waiting for AWS. Keep that
         # slow work off the scheduler loop so the role and tunnel clocks still
         # fire on time.  Credential writers remain serialized below: project
-        # scripts rewrite ~/.aws/credentials as a whole file.
+        # credential operations rewrite ~/.aws/credentials as a whole file.
         self._schedule_lock = threading.RLock()
         self._credential_write_lock = threading.Lock()
         self._project_refresh_thread: threading.Thread | None = None
@@ -148,8 +148,8 @@ class RefreshScheduler:
             )
             self._schedule_credential(project, now, success=False)
             return
-        # Project refreshes are the only operations with untrusted third-party
-        # script code.  Serialize their writes, but run the batch in a worker
+        # Service refreshes may involve slow AWS discovery. Serialize their
+        # writes, but run the batch in a worker
         # so this cannot freeze proxy or role monitoring.
         with self._credential_write_lock:
             refreshed = run_project_refresh(self.settings, project)
@@ -270,8 +270,22 @@ class RefreshScheduler:
             self.next_sshuttle_check = now + project.restart_delay_seconds
             return
         LOG.info("sshuttle for %s is not running; starting it", project.name)
+        # The old reference script refreshed this service profile as a side
+        # effect of starting sshuttle. Keep that behavior explicit and owned by
+        # Accessor now that no project script is executed.
+        with self._credential_write_lock:
+            credential_ready = run_project_refresh(self.settings, project)
+        self._report_status(
+            "project", project.name,
+            "有效" if credential_ready else "刷新失败",
+            "刷新",
+        )
+        if not credential_ready:
+            self.next_sshuttle_check = now + project.restart_delay_seconds
+            self._report_status("proxy", "demand", "启动失败（Proxy 凭证刷新失败）", "重试")
+            return
         started = self.sshuttle.start(
-            project, prepare_network=self.settings.prepare_network_before_proxy
+            self.settings.proxy, prepare_network=self.settings.prepare_network_before_proxy
         )
         self.next_sshuttle_check = now + (
             self.settings.sshuttle_check_seconds if started else project.restart_delay_seconds
@@ -281,15 +295,15 @@ class RefreshScheduler:
             "启动" if started else "重启",
         )
         if started:
-            # Starting the original project script already refreshed this one
-            # service credential. Do not run a duplicate refresh immediately.
+            # Starting the connector already refreshed this service credential.
+            # Do not run a duplicate refresh immediately.
             self._schedule_credential(project, now, success=True)
 
     def _initial_refreshes(self, now: float) -> None:
         """Start the tunnel once and refresh all other selected project profiles."""
         self._check_sshuttle(now)
-        # The proxy script already refreshes its own project credential when
-        # Accessor owns it.  Keep the remaining project work asynchronous.
+        # The connector refreshes its own service credential when Accessor owns
+        # the tunnel. Keep the remaining target work asynchronous.
         if self.proxy_project is not None and self.sshuttle.is_alive():
             with self._schedule_lock:
                 self.next_credential_refresh[self.proxy_project.name] = (

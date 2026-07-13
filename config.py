@@ -43,29 +43,40 @@ class RoleConfig:
 
 @dataclasses.dataclass(frozen=True)
 class ProjectConfig:
-    """Information needed to reuse one project's existing proxy script."""
+    """AWS service credential target; it has no local checkout dependency."""
 
     name: str
     description: str
-    directory: Path
-    script: Path
-    python: str
-    arguments: tuple[str, ...]
     depends_on_role: str | None
     credential_refresh_seconds: int
     credential_retry_seconds: int
     restart_delay_seconds: int
     shutdown_grace_seconds: int
+    service_name: str = ""
+    credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-stg"
+    ecs_cluster_name: str = ""
+    ec2_cluster_tag: str | None = None
+    discovery_tag: str = "service"
+    discovery_value: str = ""
+    session_name_mode: str = "granted_sso"
+    session_name_prefix: str = "local_testing"
 
-    @property
-    def script_path(self) -> Path:
-        """Resolve a relative script path inside the project checkout."""
-        return self.script if self.script.is_absolute() else self.directory / self.script
 
-    @property
-    def proxy_command(self) -> tuple[str, ...]:
-        """Run the project script normally, which starts sshuttle once."""
-        return (self.python, str(self.script_path), *self.arguments)
+@dataclasses.dataclass(frozen=True)
+class ProxyConfig:
+    """Shared Demand Proxy settings extracted from the reference behavior."""
+
+    profile: str = "LocalStagingJumpRole@tvlk-fpr-stg"
+    service_name: str = "fprpapi"
+    parameter_mapping: str = "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
+    region: str = "ap-southeast-1"
+    exclude_cidr: str = "172.17.0.0/16"
+    subnets: tuple[str, ...] = (
+        "172.16.0.0/12",
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+    )
+    ssh_user: str = "ubuntu"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,10 +95,11 @@ class Settings:
     default_proxy: str | None
     roles: tuple[RoleConfig, ...]
     projects: tuple[ProjectConfig, ...]
+    proxy: ProxyConfig = ProxyConfig()
     # Private endpoints that prove sshuttle forwarding works end to end.
     proxy_health_urls: tuple[str, ...] = ()
-    # A project-owned credential script is isolated in a worker.  Its shorter
-    # timeout prevents one stalled AWS call from starving every other project.
+    # A service credential operation is isolated in a worker. Its shorter
+    # timeout prevents one stalled AWS call from starving every other target.
     project_command_timeout_seconds: int = 90
 
     @property
@@ -172,22 +184,40 @@ def _read_projects(
         field = f"projects[{index}]"
         if not isinstance(entry, dict):
             raise ConfigError(f"{field} must be a table")
-        name, directory = entry.get("name"), entry.get("directory")
+        name = entry.get("name")
         if not isinstance(name, str) or not name:
             raise ConfigError(f"{field}.name must be a non-empty string")
         if name in names:
             raise ConfigError(f"duplicate project name: {name}")
-        if not isinstance(directory, str) or not directory:
-            raise ConfigError(f"{field}.directory must be a non-empty string")
         description = entry.get("description", "")
         if not isinstance(description, str):
             raise ConfigError(f"{field}.description must be a string")
-        script = entry.get("script", "scripts/python/establish_proxy_connection.py")
-        python = entry.get("python", "python3")
-        if not isinstance(script, str) or not script:
-            raise ConfigError(f"{field}.script must be a non-empty string")
-        if not isinstance(python, str) or not python:
-            raise ConfigError(f"{field}.python must be a non-empty string")
+        service_name = entry.get("service_name", "fprpapi" if name == "fprsapi" else name)
+        if not isinstance(service_name, str) or not service_name:
+            raise ConfigError(f"{field}.service_name must be a non-empty string")
+        credential_profile = entry.get(
+            "credential_profile", "LocalStagingJumpRole@tvlk-fpr-stg"
+        )
+        if not isinstance(credential_profile, str) or not credential_profile:
+            raise ConfigError(f"{field}.credential_profile must be a non-empty string")
+        ecs_cluster_name = entry.get("ecs_cluster_name", "")
+        ec2_cluster_tag = entry.get("ec2_cluster_tag")
+        discovery_tag = entry.get("discovery_tag", "service")
+        discovery_value = entry.get("discovery_value", service_name)
+        session_name_mode = entry.get("session_name_mode", "granted_sso")
+        session_name_prefix = entry.get("session_name_prefix", "local_testing")
+        if not isinstance(ecs_cluster_name, str):
+            raise ConfigError(f"{field}.ecs_cluster_name must be a string")
+        if ec2_cluster_tag is not None and not isinstance(ec2_cluster_tag, str):
+            raise ConfigError(f"{field}.ec2_cluster_tag must be a string")
+        for value, name_hint in (
+            (discovery_tag, "discovery_tag"),
+            (discovery_value, "discovery_value"),
+            (session_name_mode, "session_name_mode"),
+            (session_name_prefix, "session_name_prefix"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ConfigError(f"{field}.{name_hint} must be a non-empty string")
         dependency = entry.get("depends_on_role")
         if dependency is not None and (
             not isinstance(dependency, str) or dependency not in role_names
@@ -200,10 +230,14 @@ def _read_projects(
             ProjectConfig(
                 name=name,
                 description=description,
-                directory=Path(directory).expanduser().resolve(),
-                script=Path(script).expanduser(),
-                python=python,
-                arguments=_string_list(entry.get("arguments"), f"{field}.arguments"),
+                service_name=service_name,
+                credential_profile=credential_profile,
+                ecs_cluster_name=ecs_cluster_name,
+                ec2_cluster_tag=ec2_cluster_tag,
+                discovery_tag=discovery_tag,
+                discovery_value=discovery_value,
+                session_name_mode=session_name_mode,
+                session_name_prefix=session_name_prefix,
                 depends_on_role=dependency,
                 credential_refresh_seconds=_positive_int(
                     entry.get("credential_refresh_seconds"),
@@ -282,6 +316,26 @@ def load_settings(config_path: Path) -> Settings:
     if not isinstance(lock_file, str) or not lock_file:
         raise ConfigError("general.lock_file must be a non-empty string")
 
+    proxy_document = document.get("proxy", {})
+    if not isinstance(proxy_document, dict):
+        raise ConfigError("[proxy] must be a table")
+    proxy = ProxyConfig(
+        profile=proxy_document.get("profile", "LocalStagingJumpRole@tvlk-fpr-stg"),
+        service_name=proxy_document.get("service_name", "fprpapi"),
+        parameter_mapping=proxy_document.get(
+            "parameter_mapping", "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
+        ),
+        region=proxy_document.get("region", "ap-southeast-1"),
+        exclude_cidr=proxy_document.get("exclude_cidr", "172.17.0.0/16"),
+        subnets=_string_list(
+            proxy_document.get("subnets"), "proxy.subnets", ProxyConfig().subnets
+        ),
+        ssh_user=proxy_document.get("ssh_user", "ubuntu"),
+    )
+    for field_name in ("profile", "service_name", "parameter_mapping", "region", "exclude_cidr", "ssh_user"):
+        if not isinstance(getattr(proxy, field_name), str) or not getattr(proxy, field_name):
+            raise ConfigError(f"proxy.{field_name} must be a non-empty string")
+
     return Settings(
         config_path=path,
         auto_request=auto_request,
@@ -307,6 +361,7 @@ def load_settings(config_path: Path) -> Settings:
         default_proxy=default_proxy,
         roles=roles,
         projects=projects,
+        proxy=proxy,
         proxy_health_urls=_string_list(
             general.get("proxy_health_urls"), "general.proxy_health_urls"
         ),
@@ -373,44 +428,34 @@ def _command_exists(command: str) -> bool:
 def validate_selection(
     settings: Settings, projects: Sequence[ProjectConfig], check_python_imports: bool
 ) -> list[str]:
-    """Validate local paths and Python dependencies without touching AWS."""
+    """Validate Accessor's own commands without touching project checkouts."""
     errors: list[str] = []
     commands = {"aws"}
     if settings.auto_request:
         commands.add(settings.request_command[0])
     if settings.proxy_health_urls:
         commands.add("curl")
-    for project in projects:
-        commands.add(project.python)
-        if not project.directory.is_dir():
-            errors.append(f"project {project.name}: directory does not exist: {project.directory}")
-        if not project.script_path.is_file():
-            errors.append(f"project {project.name}: proxy script does not exist: {project.script_path}")
+    commands.add("sshuttle")
     for command in sorted(commands):
         if not _command_exists(command):
             errors.append(f"command not found: {command}")
 
-    # The project's own interpreter must import boto3 because it runs the
-    # credential worker and the original proxy script.
+    # Accessor itself owns the boto3 implementation now; no project Python
+    # interpreter or checkout is imported.
     if check_python_imports:
-        for project in projects:
-            if not _command_exists(project.python):
-                continue
-            try:
-                result = subprocess.run(
-                    [project.python, "-c", "import boto3"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as error:
-                errors.append(f"project {project.name}: failed to check boto3: {error}")
-                continue
+        try:
+            result = subprocess.run(
+                [os.environ.get("PYTHON", "python3"), "-c", "import boto3"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            errors.append(f"Accessor: failed to check boto3: {error}")
+        else:
             if result.returncode != 0:
-                detail = (result.stderr or "").strip().splitlines()
-                suffix = f": {detail[-1]}" if detail else ""
-                errors.append(f"project {project.name}: {project.python} cannot import boto3{suffix}")
+                errors.append(f"Accessor: boto3 is unavailable: {result.stderr.strip()}")
     return errors

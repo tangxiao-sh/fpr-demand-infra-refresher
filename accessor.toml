@@ -6,8 +6,8 @@
 auto_request = true
 request_command = ["assume", "--wait", "--export"]
 command_timeout_seconds = 300
-# Individual project service-credential scripts are expected to finish within
-# seconds.  A shorter bound keeps one stalled project from delaying the rest.
+# Individual service-credential AWS operations are expected to finish within
+# seconds. A shorter bound keeps one stalled target from delaying the rest.
 project_command_timeout_seconds = 90
 post_request_delay_seconds = 2
 
@@ -16,7 +16,7 @@ post_request_delay_seconds = 2
 prepare_network_before_proxy = true
 
 # sshuttle is independent from credential rotation. Check it every five minutes
-# and restart it only when its project proxy script has exited.
+# and restart the Accessor-managed tunnel only when it has exited or failed health checks.
 sshuttle_check_seconds = 300
 
 # Every five-minute sshuttle check calls these private endpoints without using
@@ -30,6 +30,17 @@ proxy_health_urls = [
 # Used when no --project flag is supplied. `accessor projects` shows all names.
 default_projects = ["fprpapi"]
 default_proxy = "fprpapi"
+
+[proxy]
+# Shared Demand Proxy parameters.  These values came from the common project
+# scripts; Accessor uses them directly and never imports a project checkout.
+profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+service_name = "fprpapi"
+parameter_mapping = "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
+region = "ap-southeast-1"
+exclude_cidr = "172.17.0.0/16"
+subnets = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
+ssh_user = "ubuntu"
 
 [[roles]]
 name = "build-artifact-reader"
@@ -55,68 +66,63 @@ refresh_seconds = 600
 retry_seconds = 60
 request_on_failure = true
 
-# Add one [[projects]] table per local checkout. `name` is the value used by
-# `accessor run --project NAME`; Accessor loads the service name from the
-# project's script, not from this config.
+# Add one [[projects]] table per AWS service target.  These entries contain
+# metadata for AWS role discovery only; no local checkout is required.
 [[projects]]
 name = "fprpapi"
-description = "SEO fprpapi checkout"
-directory = "/Users/tang.xiao/IdeaProjects/seo/fpr-fprpapi"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprpapi service credentials"
+service_name = "fprpapi"
+discovery_tag = "cluster"
+discovery_value = "fprpapi-app"
+session_name_mode = "caller"
+session_name_prefix = "local_staging"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprdapi"
-description = "SEO fprdapi checkout"
-directory = "/Users/tang.xiao/IdeaProjects/seo/fpr-fprdapi"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprdapi service credentials"
+service_name = "fprdapi"
+ec2_cluster_tag = "fprdapi-app"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprcinv"
-description = "IATA fprcinv checkout"
-directory = "/Users/tang.xiao/IdeaProjects/IATA/fpr-fprcinv"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprcinv service credentials"
+service_name = "fprcinv"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprinv"
-description = "fprinv checkout"
-directory = "/Users/tang.xiao/IdeaProjects/fpr-fprinv"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprinv service credentials"
+service_name = "fprinv"
+ec2_cluster_tag = "fprinv-app"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprsapi"
-description = "fprsapi checkout (uses the existing fprpapi credential script)"
-directory = "/Users/tang.xiao/IdeaProjects/fpr-fprsapi"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprsapi service credentials (uses fprpapi service role)"
+service_name = "fprpapi"
+discovery_tag = "cluster"
+discovery_value = "fprpapi-app"
+session_name_mode = "caller"
+session_name_prefix = "local_staging"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprasix"
-description = "IATA fprasix checkout"
-directory = "/Users/tang.xiao/IdeaProjects/IATA/fpr-fprasix"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprasix service credentials"
+service_name = "fprasix"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprdsaf"
-description = "decrypt-PQID fprdsaf checkout"
-directory = "/Users/tang.xiao/IdeaProjects/decrypt-PQID/fpr-fprdsaf"
-script = "scripts/python/establish_proxy_connection.py"
-python = "python3"
+description = "fprdsaf service credentials"
+service_name = "fprdsaf"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700

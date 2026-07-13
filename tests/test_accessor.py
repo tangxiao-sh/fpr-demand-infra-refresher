@@ -194,21 +194,18 @@ class SettingsTest(unittest.TestCase):
 
                 [[projects]]
                 name = "papi"
-                directory = "{directory}"
-                script = "proxy.py"
+                service_name = "papi"
                 depends_on_role = "jump"
                 {extra}
 
                 [[projects]]
                 name = "cinv"
-                directory = "{directory}"
-                script = "proxy.py"
+                service_name = "cinv"
                 depends_on_role = "jump"
                 """
             ),
             encoding="utf-8",
         )
-        (directory / "proxy.py").touch()
         return config_path
 
     def test_loads_projects_and_selects_one_proxy_owner(self) -> None:
@@ -220,7 +217,7 @@ class SettingsTest(unittest.TestCase):
 
         self.assertEqual(settings.sshuttle_check_seconds, 300)
         self.assertTrue(settings.prepare_network_before_proxy)
-        self.assertEqual(settings.projects[0].script_path, directory.resolve() / "proxy.py")
+        self.assertEqual(settings.projects[0].service_name, "papi")
         self.assertEqual([project.name for project in selected], ["papi", "cinv"])
         self.assertEqual(proxy.name, "papi")
 
@@ -358,69 +355,24 @@ class PermissionsTest(unittest.TestCase):
     @staticmethod
     def project(proxy: Path) -> config.ProjectConfig:
         return config.ProjectConfig(
-            name="test-project", description="", directory=proxy.parent, script=proxy,
-            python="python3", arguments=(), depends_on_role="jump",
+            name="test-project", description="", service_name="example-service",
+            depends_on_role="jump",
             credential_refresh_seconds=2700, credential_retry_seconds=60,
             restart_delay_seconds=10, shutdown_grace_seconds=15,
         )
 
-    def test_service_refresh_does_not_run_proxy_main_block(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            marker = directory / "result.txt"
-            proxy = directory / "proxy.py"
-            proxy.write_text(
-                textwrap.dedent(
-                    f"""
-                    from pathlib import Path
-                    class FakeBoto3:
-                        def setup_default_session(self, profile_name, region_name): pass
-                    boto3 = FakeBoto3()
-                    aws_profile = "JumpRole@example"
-                    service_name = "example-service"
-                    ecs_cluster_name = "cluster"
-                    tag_cluster = "tag"
-                    def get_credential(ecs_cluster_name, service_name, tag_cluster): return {{"opaque": "credential"}}
-                    def write_credential(service_name, credential): Path({str(marker)!r}).write_text(service_name)
-                    if __name__ == "__main__":
-                        raise AssertionError("sshuttle main block must not run")
-                    """
-                ), encoding="utf-8"
-            )
-            service = permissions.refresh_project_credentials(self.project(proxy))
-            written_service = marker.read_text(encoding="utf-8")
-
-        self.assertEqual(service, "example-service")
-        self.assertEqual(written_service, "example-service")
-
-    def test_service_refresh_supports_older_session_name_scripts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            marker = directory / "result.txt"
-            proxy = directory / "proxy.py"
-            proxy.write_text(
-                textwrap.dedent(
-                    f"""
-                    from pathlib import Path
-                    class FakeBoto3:
-                        def setup_default_session(self, profile_name, region_name): pass
-                    boto3 = FakeBoto3()
-                    aws_profile = "JumpRole@example"
-                    service_name = "older-service"
-                    ecs_cluster_name = "cluster"
-                    def read_aws_config(profile_name): return "developer-session"
-                    def get_credential(ecs_cluster_name, service_name, session_name):
-                        assert session_name == "developer-session"
-                        return {{"opaque": "credential"}}
-                    def write_credential(service_name, credential): Path({str(marker)!r}).write_text(service_name)
-                    """
-                ), encoding="utf-8"
-            )
-            service = permissions.refresh_project_credentials(self.project(proxy))
-            written_service = marker.read_text(encoding="utf-8")
-
-        self.assertEqual(service, "older-service")
-        self.assertEqual(written_service, "older-service")
+    @mock.patch("permissions.refresh_service_credentials", return_value="example-service")
+    def test_service_refresh_uses_accessor_owned_implementation(self, refresh: mock.Mock) -> None:
+        project = self.project(Path("/tmp/unused-project-script.py"))
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=False, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=(), default_proxy=None,
+            roles=(), projects=(project,),
+        )
+        self.assertEqual(permissions.refresh_project_credentials(settings, project), "example-service")
+        refresh.assert_called_once_with(settings, project)
 
 
 class SshuttleProcessTest(unittest.TestCase):
@@ -460,14 +412,12 @@ class SshuttleProcessTest(unittest.TestCase):
 
         self.assertEqual(sshuttle.SshuttleProcess.find_external_proxy_pids(), (111, 222, 333))
 
+    @mock.patch("sshuttle.shutil.which", return_value="/usr/bin/sshuttle")
     @mock.patch("sshuttle.subprocess.Popen")
-    def test_proxy_is_detached_from_the_interactive_console(self, popen: mock.Mock) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = PermissionsTest.project(Path(temporary) / "proxy.py")
-            project.script_path.parent.mkdir(parents=True, exist_ok=True)
-            project.script_path.touch()
-            manager = sshuttle.SshuttleProcess()
-            self.assertTrue(manager.start(project, prepare_network=False))
+    def test_proxy_is_detached_from_the_interactive_console(self, popen: mock.Mock, _which: mock.Mock) -> None:
+        manager = sshuttle.SshuttleProcess()
+        with mock.patch.object(manager, "_find_proxy_instance", return_value="i-123"):
+            self.assertTrue(manager.start(config.ProxyConfig(), prepare_network=False))
 
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)

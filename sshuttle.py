@@ -9,8 +9,11 @@ from typing import Callable, Sequence
 import shutil
 import signal
 import subprocess
+import json
 
-from config import ProjectConfig
+import boto3
+
+from config import ProjectConfig, ProxyConfig
 
 
 LOG = logging.getLogger("accessor.sshuttle")
@@ -83,7 +86,7 @@ def prepare_network_before_proxy(password_provider: Callable[[], str] | None = N
 
 
 class SshuttleProcess:
-    """Start, inspect, and stop one project script that owns sshuttle."""
+    """Start, inspect, and stop Accessor's shared Demand Proxy tunnel."""
 
     def __init__(self) -> None:
         self.process: subprocess.Popen[object] | None = None
@@ -192,22 +195,86 @@ class SshuttleProcess:
             "sshuttle" in line.lower() for line in result.stdout.splitlines()
         )
 
-    def start(self, project: ProjectConfig, prepare_network: bool = True) -> bool:
-        """Run proxy in a detached session after foreground sudo preparation."""
+    @staticmethod
+    def _find_proxy_instance(proxy: ProxyConfig) -> str:
+        """Resolve the shared proxy EC2 instance from Parameter Store."""
+        session = boto3.Session(profile_name=proxy.profile, region_name=proxy.region)
+        ssm = session.client("ssm")
+        value = ssm.get_parameter(Name=proxy.parameter_mapping)["Parameter"]["Value"]
+        mapping = json.loads(value)
+        instance_name = next(
+            (
+                name
+                for name, services in mapping.items()
+                if proxy.service_name in (services if isinstance(services, list) else [services])
+            ),
+            None,
+        )
+        if not instance_name:
+            raise RuntimeError(f"service {proxy.service_name} is absent from proxy mapping")
+
+        autoscaling = session.client("autoscaling")
+        groups = autoscaling.describe_auto_scaling_groups(
+            Filters=[{"Name": "tag:Cluster", "Values": [instance_name]}]
+        ).get("AutoScalingGroups", [])
+        if not groups:
+            raise RuntimeError(f"no Auto Scaling Group found for proxy {instance_name}")
+        group = groups[0]
+        if group.get("DesiredCapacity", 0) == 0:
+            autoscaling.update_auto_scaling_group(
+                AutoScalingGroupName=group["AutoScalingGroupName"], DesiredCapacity=1
+            )
+
+        ec2 = session.client("ec2")
+        running_filter = [
+            {"Name": "tag:Name", "Values": [instance_name]},
+            {"Name": "instance-state-name", "Values": ["running"]},
+        ]
+        ec2.get_waiter("instance_running").wait(Filters=running_filter)
+        response = ec2.describe_instances(Filters=running_filter)
+        instances = [
+            instance
+            for reservation in response.get("Reservations", [])
+            for instance in reservation.get("Instances", [])
+        ]
+        if not instances:
+            raise RuntimeError(f"proxy instance {instance_name} did not become available")
+        instance_id = instances[0]["InstanceId"]
+        ec2.get_waiter("instance_status_ok").wait(InstanceIds=[instance_id])
+        return instance_id
+
+    def start(self, proxy: ProxyConfig, prepare_network: bool = True) -> bool:
+        """Start Accessor's own sshuttle command without a project checkout."""
         if self.is_alive():
             return True
         if prepare_network and not prepare_network_before_proxy():
             return False
-        LOG.info("Starting sshuttle for %s", project.name)
         try:
+            instance_id = self._find_proxy_instance(proxy)
+            sshuttle = shutil.which("sshuttle")
+            if sshuttle is None:
+                raise OSError("sshuttle executable was not found")
             # sudo -v has completed before this point. The child can therefore
             # be detached: it cannot steal menu input or render over the status
             # screen, while its sshuttle output remains available in a log file.
             self.log_path = Path("/tmp") / "accessor-demand-proxy.log"
             self.log_handle = self.log_path.open("a", encoding="utf-8")
+            command = [
+                sshuttle,
+                "--dns",
+                "-x",
+                proxy.exclude_cidr,
+                "-Hvr",
+                f"{proxy.ssh_user}@{instance_id}",
+                *proxy.subnets,
+                "--ssh-cmd",
+                "ssh -oStrictHostKeyChecking=no",
+            ]
+            environment = os.environ.copy()
+            environment["AWS_PROFILE"] = proxy.profile
             self.process = subprocess.Popen(
-                project.proxy_command,
-                cwd=project.directory,
+                command,
+                env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=self.log_handle,
                 stderr=subprocess.STDOUT,
@@ -216,7 +283,14 @@ class SshuttleProcess:
             LOG.info("Proxy output is written to %s", self.log_path)
             return True
         except OSError as error:
-            LOG.error("Unable to start sshuttle for %s: %s", project.name, error)
+            LOG.error("Unable to start sshuttle: %s", error)
+            self.process = None
+            if self.log_handle is not None:
+                self.log_handle.close()
+                self.log_handle = None
+            return False
+        except Exception as error:
+            LOG.error("Unable to resolve/start sshuttle: %s", error)
             self.process = None
             if self.log_handle is not None:
                 self.log_handle.close()
@@ -258,7 +332,7 @@ class SshuttleProcess:
                 pass
 
     def stop(self, project: ProjectConfig) -> None:
-        """Stop the Python script, its shell, and sshuttle when Accessor exits."""
+        """Stop the sshuttle process tree when Accessor exits."""
         process = self.process
         if process is None or process.poll() is not None:
             self.process = None
