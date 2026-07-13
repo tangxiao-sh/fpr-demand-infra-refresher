@@ -1,0 +1,122 @@
+[general]
+# Accessor checks the exact AWS profile first. On failure it calls Granted's
+# `assume --wait --export PROFILE` with the exact profile, never an ambiguous
+# "latest". `--export` persists the newly granted session for later AWS/Boto
+# processes; without it credentials only exist in Assume's temporary shell.
+auto_request = true
+request_command = ["assume", "--wait", "--export"]
+command_timeout_seconds = 300
+# Individual project service-credential scripts are expected to finish within
+# seconds.  A shorter bound keeps one stalled project from delaying the rest.
+project_command_timeout_seconds = 90
+post_request_delay_seconds = 2
+
+# Before every new proxy start, authenticate in the terminal with `sudo -v`,
+# then flush DNS caches and reload PF using non-interactive sudo commands.
+prepare_network_before_proxy = true
+
+# sshuttle is independent from credential rotation. Check it every five minutes
+# and restart it only when its project proxy script has exited.
+sshuttle_check_seconds = 300
+
+# Every five-minute sshuttle check calls these private endpoints without using
+# any HTTP proxy. All failures means the tunnel is unhealthy and is restarted.
+proxy_health_urls = [
+  "https://fprcinv.fpr.stg-tvlk.cloud/healthcheck",
+  "https://fprmfdt.fpr.stg-tvlk.cloud/healthcheck",
+  "https://fprspdt.fpr.stg-tvlk.cloud/healthcheck",
+]
+
+# Used when no --project flag is supplied. `accessor projects` shows all names.
+default_projects = ["fprpapi"]
+default_proxy = "fprpapi"
+
+[[roles]]
+name = "build-artifact-reader"
+profile = "BeiartfReader@tvlk-build-special"
+refresh_seconds = 600
+retry_seconds = 60
+request_on_failure = true
+
+[[roles]]
+# fprdapi Gradle uses `systemProp.aws.profile=beiartf`. It is deliberately a
+# separate status row from the Granted build role above.
+name = "gradle-beiartf"
+profile = "beiartf"
+credential_source_profile = "BeiartfReader@tvlk-build-special"
+refresh_seconds = 600
+retry_seconds = 60
+request_on_failure = false
+
+[[roles]]
+name = "local-staging-jump"
+profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+refresh_seconds = 600
+retry_seconds = 60
+request_on_failure = true
+
+# Add one [[projects]] table per local checkout. `name` is the value used by
+# `accessor run --project NAME`; Accessor loads the service name from the
+# project's script, not from this config.
+[[projects]]
+name = "fprpapi"
+description = "SEO fprpapi checkout"
+directory = "/Users/tang.xiao/IdeaProjects/seo/fpr-fprpapi"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprdapi"
+description = "SEO fprdapi checkout"
+directory = "/Users/tang.xiao/IdeaProjects/seo/fpr-fprdapi"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprcinv"
+description = "IATA fprcinv checkout"
+directory = "/Users/tang.xiao/IdeaProjects/IATA/fpr-fprcinv"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprinv"
+description = "fprinv checkout"
+directory = "/Users/tang.xiao/IdeaProjects/fpr-fprinv"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprsapi"
+description = "fprsapi checkout (uses the existing fprpapi credential script)"
+directory = "/Users/tang.xiao/IdeaProjects/fpr-fprsapi"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprasix"
+description = "IATA fprasix checkout"
+directory = "/Users/tang.xiao/IdeaProjects/IATA/fpr-fprasix"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprdsaf"
+description = "decrypt-PQID fprdsaf checkout"
+directory = "/Users/tang.xiao/IdeaProjects/decrypt-PQID/fpr-fprdsaf"
+script = "scripts/python/establish_proxy_connection.py"
+python = "python3"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
