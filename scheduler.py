@@ -15,7 +15,7 @@ from typing import Any, Callable, Sequence
 
 from config import ProjectConfig, RoleConfig, Settings
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, run_project_refresh
-from sshuttle import SshuttleProcess
+from sshuttle import SshuttleProcess, proxy_start_error
 
 
 LOG = logging.getLogger("accessor.scheduler")
@@ -219,7 +219,7 @@ class RefreshScheduler:
         self._project_refresh_thread.start()
 
     def _check_sshuttle(self, now: float) -> None:
-        """Long-interval liveness check; restart only if the tunnel is dead."""
+        """Long-interval liveness check and recovery for the shared tunnel."""
         project = self.proxy_project
         if project is None or now < self.next_sshuttle_check:
             return
@@ -228,22 +228,32 @@ class RefreshScheduler:
             if total and healthy == 0:
                 external_pids = self.sshuttle.find_external_proxy_pids()
                 if external_pids:
-                    status = f"不可用（外部 Proxy 健康检查 0/{total}）"
-                else:
-                    # We must not silently start a privileged proxy from a
-                    # daemon thread: sudo may need a password and has no safe
-                    # prompt there.  The menu's 开启/刷新 path collects it in
-                    # the terminal, then starts the connector safely.
-                    status = "外部 Proxy 已退出（请执行开启/刷新重新建立）"
-            elif total and healthy < total:
-                status = f"运行中（外部 Proxy，部分健康 {healthy}/{total}）"
-            elif total:
-                status = f"运行中（外部 Proxy，健康 {healthy}/{total}）"
+                    self._report_status(
+                        "proxy", "demand",
+                        f"不可用（外部 Proxy 健康检查 0/{total}，正在接管重启）",
+                        "接管",
+                    )
+                    remaining = self.sshuttle.stop_external_proxy(external_pids)
+                    if remaining:
+                        self._report_status(
+                            "proxy", "demand",
+                            f"接管等待外部进程退出：{', '.join(map(str, remaining))}",
+                            "重启",
+                        )
+                        self.next_sshuttle_check = now + project.restart_delay_seconds
+                        return
+                # It is now safe to replace the failed external connection.
+                self.manage_proxy = True
             else:
-                status = "运行中（外部 Proxy，未配置健康检查）"
-            self._report_status("proxy", "demand", status, "检查")
-            self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
-            return
+                if total and healthy < total:
+                    status = f"运行中（外部 Proxy，部分健康 {healthy}/{total}）"
+                elif total:
+                    status = f"运行中（外部 Proxy，健康 {healthy}/{total}）"
+                else:
+                    status = "运行中（外部 Proxy，未配置健康检查）"
+                self._report_status("proxy", "demand", status, "检查")
+                self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
+                return
         if self.sshuttle.is_alive():
             healthy, total = self.sshuttle.check_health(self.settings.proxy_health_urls)
             if total and healthy == 0:
@@ -270,45 +280,30 @@ class RefreshScheduler:
             self.next_sshuttle_check = now + project.restart_delay_seconds
             return
         LOG.info("sshuttle for %s is not running; starting it", project.name)
-        # The old reference script refreshed this service profile as a side
-        # effect of starting sshuttle. Keep that behavior explicit and owned by
-        # Accessor now that no project script is executed.
-        with self._credential_write_lock:
-            credential_ready = run_project_refresh(self.settings, project)
-        self._report_status(
-            "project", project.name,
-            "有效" if credential_ready else "刷新失败",
-            "刷新",
-        )
-        if not credential_ready:
-            self.next_sshuttle_check = now + project.restart_delay_seconds
-            self._report_status("proxy", "demand", "启动失败（Proxy 凭证刷新失败）", "重试")
-            return
+        # Proxy startup is intentionally independent from service credentials.
+        # The tunnel only uses the configured jump-role AWS profile; selected
+        # service profiles are refreshed by the separate project worker below.
         started = self.sshuttle.start(
             self.settings.proxy, prepare_network=self.settings.prepare_network_before_proxy
         )
-        self.next_sshuttle_check = now + (
-            self.settings.sshuttle_check_seconds if started else project.restart_delay_seconds
-        )
-        self._report_status(
-            "proxy", "demand", "运行中（Accessor 管理）" if started else "启动失败（将重试）",
-            "启动" if started else "重启",
-        )
+        # A child process being created does not prove traffic can pass.
+        # Verify a newly started or taken-over tunnel once after its short
+        # restart delay, then use the normal long health-check interval.
+        self.next_sshuttle_check = now + project.restart_delay_seconds
         if started:
-            # Starting the connector already refreshed this service credential.
-            # Do not run a duplicate refresh immediately.
-            self._schedule_credential(project, now, success=True)
+            proxy_status = "启动中（等待健康检查）"
+        else:
+            reason = proxy_start_error()
+            proxy_status = f"启动失败（将重试）：{reason}" if reason else "启动失败（将重试）"
+        self._report_status("proxy", "demand", proxy_status, "启动" if started else "重启")
 
     def _initial_refreshes(self, now: float) -> None:
-        """Start the tunnel once and refresh all other selected project profiles."""
+        """Start the tunnel once and queue every selected service refresh."""
         self._check_sshuttle(now)
-        # The connector refreshes its own service credential when Accessor owns
-        # the tunnel. Keep the remaining target work asynchronous.
-        if self.proxy_project is not None and self.sshuttle.is_alive():
-            with self._schedule_lock:
-                self.next_credential_refresh[self.proxy_project.name] = (
-                    now + self.proxy_project.credential_refresh_seconds
-                )
+        # Proxy startup only establishes a route. It never refreshes the
+        # connector service profile, so leave its initial due time untouched.
+        # The project worker below will refresh it alongside every other
+        # selected service profile.
         self._start_due_projects(now)
 
     def _sleep(self, now: float) -> None:

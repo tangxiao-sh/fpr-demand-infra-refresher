@@ -126,3 +126,10 @@ description = "fprdsaf service credentials"
 service_name = "fprdsaf"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprbpf"
+description = "fprbpf service credentials"
+service_name = "fprbpf"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700

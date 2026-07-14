@@ -101,6 +101,10 @@ not take over the interactive Accessor console. Use `tail -f
 Background service-credential refresh output is similarly written to
 `/tmp/accessor-credential-refresh.log`, keeping the status menu usable.
 
+Build tools that run inside a long-lived Gradle daemon may cache AWS sessions.
+After Accessor refreshes the `beiartf` profile, run `./gradlew --stop` once and
+start the build again so the JVM reads the new session from disk.
+
 Before every new proxy start, Accessor runs `sudo -v` in the terminal, then:
 `dscacheutil -flushcache`, `killall -HUP mDNSResponder`, and
 `pfctl -f /etc/pf.conf`. The password is entered directly in the terminal with

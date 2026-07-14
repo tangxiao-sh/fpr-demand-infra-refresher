@@ -87,6 +87,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+    # boto3 emits this at INFO whenever it loads ~/.aws/credentials. It is
+    # normal implementation detail, not an Accessor event, and would otherwise
+    # leak into a terminal/log every time the independent credential worker runs.
+    logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
     args = parse_arguments(argv)
     try:
         settings = load_settings(args.config)

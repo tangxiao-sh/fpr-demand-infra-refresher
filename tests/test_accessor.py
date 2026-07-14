@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -280,7 +281,7 @@ class PermissionsTest(unittest.TestCase):
         )
         refresher = permissions.RoleRefresher(settings)
         with (
-            mock.patch.object(refresher, "_check_profile", side_effect=[False, True]),
+            mock.patch.object(refresher, "_check_profile", side_effect=[True, True]),
             mock.patch.object(refresher, "_copy_credential_profiles", return_value=True) as copy,
         ):
             self.assertTrue(refresher.refresh(role))
@@ -412,6 +413,56 @@ class SshuttleProcessTest(unittest.TestCase):
 
         self.assertEqual(sshuttle.SshuttleProcess.find_external_proxy_pids(), (111, 222, 333))
 
+    @mock.patch("sshuttle.os.kill")
+    @mock.patch("sshuttle.time.sleep")
+    def test_stops_external_proxy_before_takeover(
+        self, _sleep: mock.Mock, kill: mock.Mock
+    ) -> None:
+        kill.side_effect = [None, ProcessLookupError()]
+
+        remaining = sshuttle.SshuttleProcess().stop_external_proxy((123,))
+
+        self.assertEqual(remaining, ())
+        self.assertEqual(kill.call_args_list[0].args, (123, signal.SIGTERM))
+
+    def test_proxy_mapping_accepts_nested_and_record_shapes(self) -> None:
+        self.assertEqual(
+            sshuttle.SshuttleProcess._mapped_instance_name(
+                {"proxy-a": ["fprpapi", "other"]}, "fprpapi"
+            ),
+            "proxy-a",
+        )
+        self.assertEqual(
+            sshuttle.SshuttleProcess._mapped_instance_name(
+                {"mapping": {"proxy-b": {"services": ["fprpapi"]}}}, "fprpapi"
+            ),
+            "proxy-b",
+        )
+        self.assertEqual(
+            sshuttle.SshuttleProcess._mapped_instance_name(
+                [{"instanceName": "proxy-c", "services": ["fprpapi"]}], "fprpapi"
+            ),
+            "proxy-c",
+        )
+        self.assertEqual(
+            sshuttle.SshuttleProcess._mapped_instance_name(
+                {"fprpapi": "proxy-d"}, "fprpapi"
+            ),
+            "proxy-d",
+        )
+        self.assertEqual(
+            sshuttle.SshuttleProcess._mapped_instance_name(
+                {"fprprxy-proxy-demand-01": {"fprpapi": "sg-0123456789abcdef0"}},
+                "fprpapi",
+            ),
+            "fprprxy-proxy-demand-01",
+        )
+        self.assertIsNone(
+            sshuttle.SshuttleProcess._mapped_instance_name(
+                {"sg-0123456789abcdef0": ["fprpapi"]}, "fprpapi"
+            )
+        )
+
     @mock.patch("sshuttle.shutil.which", return_value="/usr/bin/sshuttle")
     @mock.patch("sshuttle.subprocess.Popen")
     def test_proxy_is_detached_from_the_interactive_console(self, popen: mock.Mock, _which: mock.Mock) -> None:
@@ -422,6 +473,8 @@ class SshuttleProcessTest(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["env"]["AWS_REGION"], "ap-southeast-1")
+        self.assertEqual(popen.call_args.kwargs["env"]["AWS_DEFAULT_REGION"], "ap-southeast-1")
         if manager.log_handle is not None:
             manager.log_handle.close()
 
@@ -449,9 +502,33 @@ class SshuttleProcessTest(unittest.TestCase):
 
         self.assertEqual(run.call_args_list[0].args[0], ["sudo", "-S", "-p", "", "-v"])
         self.assertEqual(run.call_args_list[0].kwargs["input"], "not-logged\n")
-        self.assertEqual(run.call_args_list[0].kwargs["stderr"], subprocess.DEVNULL)
-        self.assertEqual(run.call_args_list[1].kwargs["stdout"], subprocess.DEVNULL)
-        self.assertEqual(run.call_args_list[3].kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(run.call_args_list[0].kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(run.call_args_list[1].kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(run.call_args_list[3].kwargs["stderr"], subprocess.PIPE)
+
+    @mock.patch("sshuttle.subprocess.run")
+    def test_network_prepare_retries_a_rejected_ui_password(self, run: mock.Mock) -> None:
+        run.side_effect = [
+            subprocess.CompletedProcess([], 1, stderr="Sorry, try again."),
+            *[subprocess.CompletedProcess([], 0) for _ in range(4)],
+        ]
+        passwords = mock.Mock(side_effect=("wrong", "correct"))
+
+        self.assertTrue(sshuttle.prepare_network_before_proxy(passwords))
+
+        self.assertEqual(passwords.call_count, 2)
+        self.assertEqual(run.call_args_list[0].kwargs["input"], "wrong\n")
+        self.assertEqual(run.call_args_list[1].kwargs["input"], "correct\n")
+
+    @mock.patch("sshuttle.subprocess.run")
+    def test_network_prepare_allows_four_password_retries(self, run: mock.Mock) -> None:
+        run.return_value = subprocess.CompletedProcess([], 1, stderr="Sorry, try again.")
+        passwords = mock.Mock(return_value="wrong")
+
+        self.assertFalse(sshuttle.prepare_network_before_proxy(passwords))
+
+        self.assertEqual(passwords.call_count, 5)
+        self.assertIn("已重试 4 次", sshuttle.network_prepare_error() or "")
 
     def test_liveness_is_just_a_process_poll(self) -> None:
         manager = sshuttle.SshuttleProcess()
@@ -464,6 +541,63 @@ class SshuttleProcessTest(unittest.TestCase):
 
 
 class SchedulerThreadTest(unittest.TestCase):
+    def test_unhealthy_external_proxy_is_taken_over_and_restarted(self) -> None:
+        project = config.ProjectConfig(
+            name="fprpapi", description="", service_name="fprpapi",
+            depends_on_role=None, credential_refresh_seconds=2700,
+            credential_retry_seconds=60, restart_delay_seconds=10, shutdown_grace_seconds=15,
+        )
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=False, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=("fprpapi",),
+            default_proxy="fprpapi", roles=(), projects=(project,),
+            proxy_health_urls=("https://private/health",),
+        )
+        worker = scheduler.RefreshScheduler(settings, (project,), project, manage_proxy=False)
+        worker.role_ready = {}
+        worker.sshuttle.check_health = mock.Mock(return_value=(0, 1))
+        worker.sshuttle.find_external_proxy_pids = mock.Mock(return_value=(123,))
+        worker.sshuttle.stop_external_proxy = mock.Mock(return_value=())
+        worker.sshuttle.is_alive = mock.Mock(return_value=False)
+        worker.sshuttle.start = mock.Mock(return_value=True)
+
+        worker._check_sshuttle(100.0)
+
+        self.assertTrue(worker.manage_proxy)
+        worker.sshuttle.stop_external_proxy.assert_called_once_with((123,))
+        worker.sshuttle.start.assert_called_once_with(settings.proxy, prepare_network=False)
+
+    def test_proxy_start_does_not_delay_connector_first_refresh(self) -> None:
+        project = config.ProjectConfig(
+            name="fprpapi",
+            description="",
+            service_name="fprpapi",
+            depends_on_role=None,
+            credential_refresh_seconds=2700,
+            credential_retry_seconds=60,
+            restart_delay_seconds=10,
+            shutdown_grace_seconds=15,
+        )
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=False, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=("fprpapi",),
+            default_proxy="fprpapi", roles=(), projects=(project,),
+        )
+        worker = scheduler.RefreshScheduler(settings, (project,), project)
+        with (
+            mock.patch.object(worker, "_check_sshuttle"),
+            mock.patch.object(worker, "_start_due_projects") as start_projects,
+        ):
+            worker.sshuttle.is_alive = mock.Mock(return_value=True)
+            worker._initial_refreshes(123.0)
+
+        self.assertEqual(worker.next_credential_refresh["fprpapi"], 0.0)
+        start_projects.assert_called_once()
+
     def test_scheduler_keeps_auto_role_renewal_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = config.Settings(

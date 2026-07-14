@@ -133,8 +133,17 @@ class RoleRefresher:
         self.last_action = "检查"
         LOG.info("Refreshing role %s (%s)", role.name, role.profile)
         if role.credential_source_profile is not None:
-            if self._check_profile(role.profile):
-                return True
+            # A long-lived consumer such as a Gradle daemon may keep using an
+            # older session even while `aws sts` can still validate the alias.
+            # Re-copy the source session on every role cycle so the profile on
+            # disk always matches the freshly granted source role.
+            if not self._check_profile(role.credential_source_profile):
+                LOG.warning(
+                    "Source profile %s is unavailable for %s",
+                    role.credential_source_profile,
+                    role.profile,
+                )
+                return False
             self.last_action = "刷新"
             return (
                 self._copy_credential_profiles(role.credential_source_profile, (role.profile,))

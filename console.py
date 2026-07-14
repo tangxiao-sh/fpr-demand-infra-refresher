@@ -15,7 +15,7 @@ from pathlib import Path
 from config import ProjectConfig, Settings
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, check_project_credentials, run_project_refresh
 from scheduler import LOCK_CONFLICT_EXIT_CODE, RefreshScheduler
-from sshuttle import prepare_network_before_proxy
+from sshuttle import network_prepare_error, prepare_network_before_proxy
 
 
 LOG = logging.getLogger("accessor.console")
@@ -369,9 +369,11 @@ class AccessorConsole:
             and not prepare_network_before_proxy(password_provider=password_provider)
         ):
             if self._ui_active:
-                self._ui_message = "网络准备失败。"
+                detail = network_prepare_error() or "未返回具体错误"
+                self._ui_message = f"网络准备失败：{detail}"
             else:
-                self._read_line("网络准备失败，按 Enter 返回")
+                detail = network_prepare_error() or "未返回具体错误"
+                self._read_line(f"网络准备失败：{detail}，按 Enter 返回")
             return
         # This is the only background job. It automatically renews both AWS
         # roles when their checks fail, then verifies them again. Granted output
@@ -747,7 +749,9 @@ class AccessorConsole:
         app = Application(layout=Layout(HSplit([status, input_area])), full_screen=True)
         self._app = app
         self._ui_active = True
-        self._start_status_refresh()
+        # Do not perform network/AWS checks merely by opening the console.
+        # Use menu option 1 when an explicit status check is wanted.
+        # self._start_status_refresh()
         try:
             app.run()
         finally:
@@ -764,7 +768,8 @@ class AccessorConsole:
     def run(self) -> int:
         if sys.stdin.isatty() and sys.stdout.isatty():
             return self._run_prompt_toolkit()
-        self._start_status_refresh()
+        # Startup is intentionally passive; explicit option 1 performs checks.
+        # self._start_status_refresh()
         while True:
             self.show_status()
             choice = self._read_line("选择操作：").strip().lower()

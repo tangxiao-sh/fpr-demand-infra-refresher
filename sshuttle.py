@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import json
+import time
 
 import boto3
 
@@ -25,6 +26,19 @@ NETWORK_PREP_COMMANDS = (
     ("killall", "-HUP", "mDNSResponder"),
     ("pfctl", "-f", "/etc/pf.conf"),
 )
+LAST_NETWORK_PREP_ERROR: str | None = None
+LAST_PROXY_START_ERROR: str | None = None
+SUDO_AUTH_ATTEMPTS = 5  # First entry plus four retries.
+
+
+def network_prepare_error() -> str | None:
+    """Return the last human-readable sudo/network preparation failure."""
+    return LAST_NETWORK_PREP_ERROR
+
+
+def proxy_start_error() -> str | None:
+    """Return the last proxy discovery/start failure without exposing secrets."""
+    return LAST_PROXY_START_ERROR
 
 
 def prepare_network_before_proxy(password_provider: Callable[[], str] | None = None) -> bool:
@@ -34,42 +48,51 @@ def prepare_network_before_proxy(password_provider: Callable[[], str] | None = N
     normal terminal password prompt and hides typed characters. Subsequent
     `sudo -n` calls explicitly refuse to prompt again or invoke an askpass GUI.
     """
+    global LAST_NETWORK_PREP_ERROR
+    LAST_NETWORK_PREP_ERROR = None
     LOG.info("Network preparation requires sudo")
     # A user may have configured SUDO_ASKPASS globally. Remove it so a missing
     # terminal fails safely instead of falling back to a graphical password UI.
     terminal_env = os.environ.copy()
     terminal_env.pop("SUDO_ASKPASS", None)
     try:
-        if password_provider is None:
-            LOG.info("Enter the password in this terminal")
-            validated = subprocess.run(
-                ["sudo", "-p", "Accessor sudo password: ", "-v"],
-                env=terminal_env,
-                check=False,
-            )
-        else:
-            password = password_provider()
-            # `-S` consumes the password from stdin. This lets the curses UI
-            # keep its screen active while still using sudo's normal timestamp
-            # cache for the following non-interactive commands.
-            validated = subprocess.run(
-                ["sudo", "-S", "-p", "", "-v"],
-                input=f"{password}\n",
-                text=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=terminal_env,
-                check=False,
-            )
-        if validated.returncode != 0:
-            LOG.error("sudo authentication failed; proxy will not start")
+        validated: subprocess.CompletedProcess[object] | None = None
+        for attempt in range(SUDO_AUTH_ATTEMPTS):
+            if password_provider is None:
+                LOG.info("Enter the password in this terminal")
+                validated = subprocess.run(
+                    ["sudo", "-p", "Accessor sudo password: ", "-v"],
+                    env=terminal_env,
+                    check=False,
+                )
+            else:
+                password = password_provider()
+                # `-S` consumes the password from stdin. This lets the UI keep
+                # its screen active while still using sudo's normal timestamp.
+                validated = subprocess.run(
+                    ["sudo", "-S", "-p", "", "-v"],
+                    input=f"{password}\n",
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=terminal_env,
+                    check=False,
+                )
+            if validated.returncode == 0:
+                break
+            if attempt + 1 < SUDO_AUTH_ATTEMPTS:
+                LOG.info("sudo password was rejected; retrying (%s/%s)", attempt + 1, SUDO_AUTH_ATTEMPTS - 1)
+        if validated is None or validated.returncode != 0:
+            detail = (getattr(validated, "stderr", "") or "").strip()
+            LAST_NETWORK_PREP_ERROR = f"sudo 认证失败（已重试 4 次）{': ' + detail if detail else ''}"
+            LOG.error("%s; proxy will not start", LAST_NETWORK_PREP_ERROR)
             return False
         for command in NETWORK_PREP_COMMANDS:
             # In the prompt_toolkit UI a password provider is supplied. Never
             # let privileged command output write directly to the terminal: a
             # single sudo/PF diagnostic would corrupt the live screen.
             hidden_output = (
-                {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
                 if password_provider is not None
                 else {}
             )
@@ -77,10 +100,15 @@ def prepare_network_before_proxy(password_provider: Callable[[], str] | None = N
                 ["sudo", "-n", *command], env=terminal_env, check=False, **hidden_output
             )
             if result.returncode != 0:
-                LOG.error("Network preparation failed: %s", " ".join(command))
+                detail = (getattr(result, "stderr", "") or "").strip()
+                LAST_NETWORK_PREP_ERROR = (
+                    f"{' '.join(command)} 失败{': ' + detail if detail else ''}"
+                )
+                LOG.error("网络准备失败：%s", LAST_NETWORK_PREP_ERROR)
                 return False
     except OSError as error:
-        LOG.error("Unable to execute sudo network preparation: %s", error)
+        LAST_NETWORK_PREP_ERROR = f"无法执行 sudo 网络准备：{error}"
+        LOG.error("%s", LAST_NETWORK_PREP_ERROR)
         return False
     return True
 
@@ -202,14 +230,7 @@ class SshuttleProcess:
         ssm = session.client("ssm")
         value = ssm.get_parameter(Name=proxy.parameter_mapping)["Parameter"]["Value"]
         mapping = json.loads(value)
-        instance_name = next(
-            (
-                name
-                for name, services in mapping.items()
-                if proxy.service_name in (services if isinstance(services, list) else [services])
-            ),
-            None,
-        )
+        instance_name = SshuttleProcess._mapped_instance_name(mapping, proxy.service_name)
         if not instance_name:
             raise RuntimeError(f"service {proxy.service_name} is absent from proxy mapping")
 
@@ -243,11 +264,124 @@ class SshuttleProcess:
         ec2.get_waiter("instance_status_ok").wait(InstanceIds=[instance_id])
         return instance_id
 
+    @staticmethod
+    def _mapped_instance_name(mapping: object, service_name: str) -> str | None:
+        """Extract a valid proxy instance/Cluster name from the SSM mapping."""
+        target = service_name.strip().lower()
+
+        def contains_service(value: object) -> bool:
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized == target:
+                    return True
+                if normalized.startswith(f"{target}-") or normalized.startswith(f"{target}_"):
+                    return True
+                # A few Parameter Store revisions serialized the service list
+                # as a comma/whitespace-delimited string instead of JSON.
+                return target in {
+                    item.strip()
+                    for item in normalized.replace(",", " ").split()
+                    if item.strip()
+                }
+            if isinstance(value, (list, tuple, set)):
+                return any(contains_service(item) for item in value)
+            if isinstance(value, dict):
+                # The actual Parameter Store shape is
+                # {proxy_cluster: {service_name: security_group_id}}. Match
+                # service names stored as dictionary keys as well as the older
+                # list/object value forms.
+                return any(
+                    contains_service(key) or contains_service(item)
+                    for key, item in value.items()
+                )
+            return False
+
+        def is_instance_name(value: object) -> bool:
+            """Reject AWS resource IDs such as ``sg-...`` as Cluster names."""
+            return isinstance(value, str) and bool(value) and not value.lower().startswith(
+                ("sg-", "subnet-", "vpc-", "i-")
+            )
+
+        instance_fields = (
+            "instance", "instance_name", "instanceName", "proxy_instance", "proxyInstance",
+            "proxy_instance_name", "proxyInstanceName", "cluster",
+        )
+        ignored_fields = {*instance_fields, "name"}
+        wrapper_fields = {"mapping", "mappings", "items", "entries", "data", "proxies"}
+
+        if isinstance(mapping, dict):
+            instance_field = next(
+                (
+                    mapping.get(field)
+                    for field in instance_fields
+                    if is_instance_name(mapping.get(field))
+                ),
+                None,
+            )
+            if instance_field:
+                service_values = [
+                    value
+                    for key, value in mapping.items()
+                    if key not in ignored_fields
+                ]
+                if any(contains_service(value) for value in service_values):
+                    return instance_field
+
+            for instance_name, services in mapping.items():
+                # Also accept the reverse form: {"service": "instance"}.
+                if str(instance_name).strip().lower() == target:
+                    if is_instance_name(services):
+                        return services
+                    if isinstance(services, list) and services and is_instance_name(services[0]):
+                        return services[0]
+                if (
+                    str(instance_name).lower() not in wrapper_fields
+                    and is_instance_name(instance_name)
+                    and contains_service(services)
+                ):
+                    return str(instance_name)
+            # Recurse only through explicit wrapper fields. Recursing through
+            # every nested value previously selected a security-group ID.
+            for key, value in mapping.items():
+                if str(key).lower() not in wrapper_fields:
+                    continue
+                found = SshuttleProcess._mapped_instance_name(value, service_name)
+                if found:
+                    return found
+        elif isinstance(mapping, list):
+            for record in mapping:
+                if not isinstance(record, dict):
+                    continue
+                instance_name = next(
+                    (
+                        record.get(field)
+                        for field in instance_fields
+                        if is_instance_name(record.get(field))
+                    ),
+                    None,
+                )
+                service_values = [
+                    value
+                    for key, value in record.items()
+                    if key not in ignored_fields
+                ]
+                if instance_name and any(contains_service(value) for value in service_values):
+                    return instance_name
+        return None
+
     def start(self, proxy: ProxyConfig, prepare_network: bool = True) -> bool:
         """Start Accessor's own sshuttle command without a project checkout."""
+        global LAST_PROXY_START_ERROR
+        LAST_PROXY_START_ERROR = None
+        # Discovery failures happen before sshuttle creates its child log
+        # stream, so keep the manager diagnostics in the same file users
+        # already inspect for proxy failures.
+        self.log_path = Path("/tmp/accessor-demand-proxy.log")
         if self.is_alive():
             return True
         if prepare_network and not prepare_network_before_proxy():
+            LAST_PROXY_START_ERROR = network_prepare_error() or "网络准备失败"
+            self._write_manager_error(LAST_PROXY_START_ERROR)
             return False
         try:
             instance_id = self._find_proxy_instance(proxy)
@@ -257,7 +391,6 @@ class SshuttleProcess:
             # sudo -v has completed before this point. The child can therefore
             # be detached: it cannot steal menu input or render over the status
             # screen, while its sshuttle output remains available in a log file.
-            self.log_path = Path("/tmp") / "accessor-demand-proxy.log"
             self.log_handle = self.log_path.open("a", encoding="utf-8")
             command = [
                 sshuttle,
@@ -272,6 +405,13 @@ class SshuttleProcess:
             ]
             environment = os.environ.copy()
             environment["AWS_PROFILE"] = proxy.profile
+            # sshuttle starts an SSH child which can invoke the AWS profile's
+            # credential process. boto3 above receives ``region_name``
+            # explicitly, but that child does not; without these variables a
+            # machine lacking a default AWS region fails with ``NoRegion`` and
+            # drops the just-created tunnel.
+            environment["AWS_REGION"] = proxy.region
+            environment["AWS_DEFAULT_REGION"] = proxy.region
             self.process = subprocess.Popen(
                 command,
                 env=environment,
@@ -283,6 +423,8 @@ class SshuttleProcess:
             LOG.info("Proxy output is written to %s", self.log_path)
             return True
         except OSError as error:
+            LAST_PROXY_START_ERROR = f"{type(error).__name__}: {error}"
+            self._write_manager_error(LAST_PROXY_START_ERROR)
             LOG.error("Unable to start sshuttle: %s", error)
             self.process = None
             if self.log_handle is not None:
@@ -290,12 +432,25 @@ class SshuttleProcess:
                 self.log_handle = None
             return False
         except Exception as error:
+            LAST_PROXY_START_ERROR = f"{type(error).__name__}: {error}"
+            self._write_manager_error(LAST_PROXY_START_ERROR)
             LOG.error("Unable to resolve/start sshuttle: %s", error)
             self.process = None
             if self.log_handle is not None:
                 self.log_handle.close()
                 self.log_handle = None
             return False
+
+    def _write_manager_error(self, message: str) -> None:
+        """Persist pre-child startup failures beside sshuttle's own output."""
+        try:
+            self.log_path = self.log_path or Path("/tmp/accessor-demand-proxy.log")
+            with self.log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} Accessor proxy start failed: {message}\n"
+                )
+        except OSError:
+            pass
 
     @staticmethod
     def _descendant_pids(root_pid: int) -> list[int]:
@@ -330,6 +485,23 @@ class SshuttleProcess:
                 os.kill(process_id, signum)
             except (ProcessLookupError, PermissionError):
                 pass
+
+    def stop_external_proxy(self, process_ids: Sequence[int]) -> tuple[int, ...]:
+        """Request shutdown of an unhealthy external proxy before replacing it."""
+        process_ids = tuple(sorted({pid for pid in process_ids if pid > 0}))
+        LOG.warning("Stopping unhealthy external sshuttle processes: %s", process_ids)
+        self._signal(process_ids, signal.SIGTERM)
+        time.sleep(0.2)
+        remaining: list[int] = []
+        for process_id in process_ids:
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass
+            remaining.append(process_id)
+        return tuple(remaining)
 
     def stop(self, project: ProjectConfig) -> None:
         """Stop the sshuttle process tree when Accessor exits."""
