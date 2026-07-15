@@ -1,69 +1,139 @@
-# Accessor CLI
+# Accessor
 
-Accessor keeps selected development AWS roles and service credentials ready.
-It contains its own AWS role-discovery, credential-rotation, Demand Proxy, and
-sshuttle implementation. The business repositories that were used as reference
-are not imported or executed at runtime; they can be absent from the machine.
+[中文版](README-zh.md)
 
-One Accessor process can refresh credentials for multiple service targets. It
-starts at most one sshuttle connection because the shared Demand Proxy routes
-overlap. Credentials refresh on their own schedule; sshuttle is only checked
-every five minutes and restarted if dead.
+Accessor keeps development AWS roles, selected service credentials, and the
+shared Demand Proxy available in one terminal application. It is self-contained:
+it does not import a business repository or run a repository-specific proxy
+script.
 
-## Commands
+## 1. Initialize
+
+Accessor currently supports macOS and expects Homebrew to be installed. From
+the cloned repository, run:
 
 ```bash
-cd Accessor
+./bootstrap.sh
+```
+
+The script installs missing command dependencies (`aws`, Granted's `assume`,
+`sshuttle`, and `curl`), then creates or updates the project-local `.venv` and
+installs its Python dependencies. It is safe to rerun.
+
+It deliberately does **not** edit `~/.aws`, run `aws configure`, sign you into
+Granted, or start a proxy. Before using Accessor, configure your own AWS and
+Granted access and confirm that this works:
+
+```bash
+assume --help
+```
+
+## 2. Start Accessor
+
+Start the console:
+
+```bash
 ./accessor
 ```
 
-打开常驻控制台，显示 Demand Proxy、权限和各项目凭证的状态：
+To start refreshes for every configured project with the default selection,
+enter `2`, press Enter, then press Enter again at the project-selection prompt.
+The second empty Enter means **all projects**.
 
-- `1`：检查状态；发现失效或未开启时会询问是否立即开启/刷新。
-- `2`：选择项目并开启或手动刷新。
-- `3`：停止所有自动刷新与共享 Proxy。
+The default interface language is Chinese. Use English when needed:
+
+```bash
+./accessor --language en
+```
+
+Use `./accessor --language zh` to switch back. UI copy is maintained in
+[locales/en.json](locales/en.json) and [locales/zh.json](locales/zh.json).
+
+### Console actions
+
+- `1` — Check roles, selected project credentials, and Proxy health without
+  changing credentials or starting a proxy. If a problem is found, Accessor
+  offers to start or refresh it.
+- `2` — Start or refresh. Enter project numbers such as `1,3`; an empty value
+  selects every configured project.
+- `3` — Stop the automatic refresh job and the Accessor-managed Demand Proxy.
+  Existing AWS credentials are left on disk.
+- `q` — Exit the console. This also stops the active refresh job.
+
+### What “Start / refresh” does
+
+1. **AWS roles** — Accessor checks the configured roles first. When a role is
+   unavailable, it invokes the configured Granted command for that exact
+   profile (`assume --wait --export PROFILE`) and verifies the resulting AWS
+   profile. The build role, its legacy `beiartf` Gradle profile, and the local
+   staging jump role are handled independently.
+2. **Demand Proxy** — Accessor resolves the shared proxy host from the SSM
+   mapping in `accessor.toml`, then starts one `sshuttle` tunnel for all selected
+   services. Before a new tunnel it asks for the terminal `sudo` password and
+   runs the required DNS/PF preparation commands. The password is not echoed.
+3. **Project credentials** — Each selected service credential profile is
+   refreshed independently. Their normal cadence is 45 minutes; a failed
+   refresh uses the configured retry interval. Updating credentials does not
+   restart a healthy Proxy.
+4. **Ongoing health** — Roles are checked every 10 minutes. The Proxy is health
+   checked every five minutes using the configured private endpoints. If an
+   Accessor-managed tunnel has failed every probe, Accessor restarts it; an
+   unhealthy external tunnel is taken over before replacement.
+
+The console shows cached status and recent activity while this work runs in the
+background. It does not perform AWS or network calls merely to redraw itself.
+
+### Logs and common follow-up
+
+- Proxy output: `/tmp/accessor-demand-proxy.log`
+- Role request output: `/tmp/accessor-role-refresh.log`
+- Service credential refresh output: `/tmp/accessor-credential-refresh.log`
+- Status activity: `/tmp/accessor-activity.log`
+
+Long-lived Gradle daemons can retain an expired AWS session. After a successful
+build-role refresh, run `./gradlew --stop` once, then start the build again.
+
+## 3. Other useful commands
+
+### List configured projects
 
 ```bash
 ./accessor projects
 ```
 
-列出可选项目。
+### Scripted, non-interactive operation
 
 ```bash
 ./accessor run --project fprpapi
-```
-
-Keep the two shared roles refreshed, start the `fprpapi` tunnel, and refresh its
-service credentials every 45 minutes without restarting sshuttle.
-
-```bash
 ./accessor run -p fprpapi -p fprcinv --proxy fprpapi
-```
-
-刷新两个项目的凭证，同时通过共享 Demand Proxy 建立 sshuttle。`fprpapi`
-在这里仅作为内部 connector，用来定位共享 proxy，并不表示它拥有 proxy 或会被刷新。
-
-```bash
 ./accessor run --all-projects --no-proxy
 ```
 
-Refresh every configured project without creating a tunnel. This is useful when
-you only need build/writelock credentials or already have a tunnel running.
+`run` keeps the selected credentials refreshed and optionally starts the shared
+Proxy. The `--proxy` value only chooses the configured connector used to resolve
+the shared proxy; it does not make that project the proxy owner. `--no-proxy`
+refreshes credentials only.
+
+### One-off operations and validation
 
 ```bash
 ./accessor refresh --project fprdapi
+./accessor refresh-project --project fprdapi
 ./accessor check --all-projects
 ./accessor run --dry-run --project fprpapi
 ```
 
-`refresh` performs one role and service-credential refresh, then exits.
-`check` verifies Accessor's own commands and boto3 without calling AWS.
-`--dry-run` prints the planned external commands without changing state.
+- `refresh` refreshes roles and the selected project credentials once, then
+  exits.
+- `refresh-project` refreshes exactly one service credential profile.
+- `check` validates configuration and local Python dependencies without calling
+  AWS.
+- `--dry-run` prints the planned work without making changes.
 
-## Add or switch service targets
+### Add a service target
 
-Add another `[[projects]]` block to `accessor.toml`; no local checkout path or
-Proxy script is needed:
+Add a `[[projects]]` table to [accessor.toml](accessor.toml). No checkout path
+or project proxy script is required.
 
 ```toml
 [[projects]]
@@ -74,61 +144,15 @@ ec2_cluster_tag = "fprbpf-app"
 depends_on_role = "local-staging-jump"
 ```
 
-`service_name` is the AWS profile written to `~/.aws/credentials`.
-`ec2_cluster_tag`, `discovery_tag`, and `discovery_value` describe where the
-service IAM role is found. Use `default_projects` and `default_proxy` to choose
-what `./accessor run` does when no project flag is supplied.
+`service_name` is the profile Accessor writes to `~/.aws/credentials`.
+Discovery fields identify the service role; `default_projects` and
+`default_proxy` determine the default console selection and proxy connector.
 
-## Permission and proxy behavior
+### Implementation layout
 
-Every 10 minutes, Accessor runs `aws sts get-caller-identity --profile ...`; this
-invokes the configured Granted `credential_process`. If a role is unavailable, it
-foreground refresh runs `assume --wait PROFILE` for that exact profile, then
-checks it again through your interactive zsh shell, so the existing Granted
-alias in `.zshenv` is used. Background refreshes remain quiet and only update menu status;
-use `检查` followed by `开启 / 刷新` to approve an expired entitlement. Use
-`--no-auto-request` if you want to see failures without requesting access.
-
-The initial Granted approval and terminal sudo preparation can still require
-interaction. On `Ctrl-C`, Accessor stops its sshuttle process and children.
-
-After the terminal sudo preparation finishes, Accessor resolves the shared
-Demand Proxy instance from the configured SSM parameter and starts sshuttle in
-its own session. Output is written to `/tmp/accessor-demand-proxy.log`; it does
-not take over the interactive Accessor console. Use `tail -f
-/tmp/accessor-demand-proxy.log` when you need to inspect proxy output.
-
-Background service-credential refresh output is similarly written to
-`/tmp/accessor-credential-refresh.log`, keeping the status menu usable.
-
-Build tools that run inside a long-lived Gradle daemon may cache AWS sessions.
-After Accessor refreshes the `beiartf` profile, run `./gradlew --stop` once and
-start the build again so the JVM reads the new session from disk.
-
-Before every new proxy start, Accessor runs `sudo -v` in the terminal, then:
-`dscacheutil -flushcache`, `killall -HUP mDNSResponder`, and
-`pfctl -f /etc/pf.conf`. The password is entered directly in the terminal with
-no echo. The following commands use `sudo -n`, so they cannot show an askpass
-dialog or request the password again. Accessor also removes `SUDO_ASKPASS` for
-these commands; if there is no interactive terminal, startup fails rather than
-falling back to a GUI prompt. If any preparation step fails, sshuttle is not
-started. Set `prepare_network_before_proxy = false` in `accessor.toml` to disable
-this sequence.
-
-## Code layout
-
-- [cli.py](cli.py): argument parsing and one-off commands.
-- [scheduler.py](scheduler.py): independent timed loops for roles, credentials, and liveness checks.
-- [permissions.py](permissions.py): Granted/AWS role requests and service credential rotation.
-- [credentials.py](credentials.py): standalone service-role discovery and credential writing.
-- [sshuttle.py](sshuttle.py): start, long-interval liveness state, and cleanup of sshuttle.
-- [config.py](config.py): TOML loading, models, and local validation.
-
-Python 3.11+ and `boto3` in Accessor's own environment are required. Accessor
-never prints credentials or creates another credential store; it writes the
-temporary service profiles to the standard `~/.aws/credentials` file.
-# Accessor
-
-`./accessor` uses the project-local `.venv` and launches a `prompt_toolkit`
-terminal UI. Its refresh worker performs AWS, credential and tunnel checks;
-the UI only renders cached state and is notified through thread-safe redraws.
+- [cli.py](cli.py) — command parsing and non-interactive commands
+- [console.py](console.py) — terminal UI and status rendering
+- [scheduler.py](scheduler.py) — independent role, credential, and Proxy clocks
+- [permissions.py](permissions.py) — Granted and AWS role handling
+- [credentials.py](credentials.py) — service-role discovery and credential writing
+- [sshuttle.py](sshuttle.py) — Proxy lifecycle and macOS network preparation

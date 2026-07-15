@@ -19,6 +19,7 @@ from config import (
     select_proxy_project,
     validate_selection,
 )
+from i18n import SUPPORTED_LANGUAGES, set_language
 from console import run_console
 from permissions import RoleRefresher, refresh_project_credentials, run_project_refresh
 from scheduler import RefreshScheduler
@@ -82,6 +83,12 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="TOML file")
     parser.add_argument("--no-auto-request", action="store_true", help="do not call Granted request")
     parser.add_argument("--dry-run", action="store_true", help="print work without executing it")
+    parser.add_argument(
+        "--language",
+        choices=SUPPORTED_LANGUAGES,
+        default="zh",
+        help="interface language: zh (Chinese, default) or en (English)",
+    )
     return parser.parse_args(argv)
 
 
@@ -92,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # leak into a terminal/log every time the independent credential worker runs.
     logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
     args = parse_arguments(argv)
+    set_language(args.language)
     try:
         settings = load_settings(args.config)
         if args.no_auto_request:

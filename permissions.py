@@ -14,6 +14,7 @@ from typing import Any, Sequence
 
 from config import ProjectConfig, RoleConfig, Settings
 from credentials import refresh_service_credentials
+from i18n import t
 
 
 LOG = logging.getLogger("accessor.permissions")
@@ -36,7 +37,7 @@ class RoleRefresher:
         # developer. The scheduler instead records the same output in a log,
         # keeping the interactive menu usable while it refreshes automatically.
         self.request_log_path = request_log_path
-        self.last_action = "检查"
+        self.last_action = t("action.check")
 
     def _run(self, command: Sequence[str], quiet: bool) -> bool:
         """Run without capturing any credential_process output or secret values."""
@@ -130,7 +131,7 @@ class RoleRefresher:
 
     def refresh(self, role: RoleConfig) -> bool:
         """Check one profile, request access if needed, then check it again."""
-        self.last_action = "检查"
+        self.last_action = t("action.check")
         LOG.info("Refreshing role %s (%s)", role.name, role.profile)
         if role.credential_source_profile is not None:
             # A long-lived consumer such as a Gradle daemon may keep using an
@@ -144,7 +145,7 @@ class RoleRefresher:
                     role.profile,
                 )
                 return False
-            self.last_action = "刷新"
+            self.last_action = t("action.refresh")
             return (
                 self._copy_credential_profiles(role.credential_source_profile, (role.profile,))
                 and self._check_profile(role.profile)
@@ -155,7 +156,7 @@ class RoleRefresher:
         if primary_ready:
             # The role itself is valid, but a legacy profile used by a build
             # tool has expired. Re-export the same session into that alias.
-            self.last_action = "刷新"
+            self.last_action = t("action.refresh")
             return self._sync_credential_aliases(role) and self._aliases_available(role)
         if not (
             self.settings.auto_request
@@ -173,7 +174,7 @@ class RoleRefresher:
         # AWS profile: an export to this short-lived shell alone would disappear
         # before the AWS/Boto processes that Accessor starts afterwards.
         shell = os.environ.get("SHELL", "/bin/zsh")
-        self.last_action = "刷新"
+        self.last_action = t("action.refresh")
         shell_command = shlex.join((*self.settings.request_command, role.profile))
         request_command = (shell, "-ic", shell_command)
         LOG.info("Requesting access for role %s", role.name)

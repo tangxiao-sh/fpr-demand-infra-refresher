@@ -15,6 +15,7 @@ import time
 import boto3
 
 from config import ProjectConfig, ProxyConfig
+from i18n import t
 
 
 LOG = logging.getLogger("accessor.sshuttle")
@@ -41,12 +42,14 @@ def proxy_start_error() -> str | None:
     return LAST_PROXY_START_ERROR
 
 
-def prepare_network_before_proxy(password_provider: Callable[[], str] | None = None) -> bool:
-    """Run required macOS network setup with a terminal-only sudo prompt.
+def prepare_network_before_proxy(
+    password_provider: Callable[[], str] | None = None, allow_prompt: bool = True
+) -> bool:
+    """Run required macOS network setup, optionally without a sudo prompt.
 
-    `sudo -v` inherits this process's stdin/stdout/stderr, so macOS displays a
-    normal terminal password prompt and hides typed characters. Subsequent
-    `sudo -n` calls explicitly refuse to prompt again or invoke an askpass GUI.
+    The foreground UI supplies a hidden password when needed. Background
+    recovery uses ``allow_prompt=False``: every sudo command is noninteractive,
+    so an expired sudo cache is reported instead of stealing terminal input.
     """
     global LAST_NETWORK_PREP_ERROR
     LAST_NETWORK_PREP_ERROR = None
@@ -57,34 +60,48 @@ def prepare_network_before_proxy(password_provider: Callable[[], str] | None = N
     terminal_env.pop("SUDO_ASKPASS", None)
     try:
         validated: subprocess.CompletedProcess[object] | None = None
-        for attempt in range(SUDO_AUTH_ATTEMPTS):
-            if password_provider is None:
-                LOG.info("Enter the password in this terminal")
-                validated = subprocess.run(
-                    ["sudo", "-p", "Accessor sudo password: ", "-v"],
-                    env=terminal_env,
-                    check=False,
-                )
-            else:
-                password = password_provider()
-                # `-S` consumes the password from stdin. This lets the UI keep
-                # its screen active while still using sudo's normal timestamp.
-                validated = subprocess.run(
-                    ["sudo", "-S", "-p", "", "-v"],
-                    input=f"{password}\n",
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=terminal_env,
-                    check=False,
-                )
-            if validated.returncode == 0:
-                break
-            if attempt + 1 < SUDO_AUTH_ATTEMPTS:
-                LOG.info("sudo password was rejected; retrying (%s/%s)", attempt + 1, SUDO_AUTH_ATTEMPTS - 1)
+        if not allow_prompt:
+            validated = subprocess.run(
+                ["sudo", "-n", "-v"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=terminal_env,
+                check=False,
+            )
+        else:
+            for attempt in range(SUDO_AUTH_ATTEMPTS):
+                if password_provider is None:
+                    LOG.info("Enter the password in this terminal")
+                    validated = subprocess.run(
+                        ["sudo", "-p", "Accessor sudo password: ", "-v"],
+                        env=terminal_env,
+                        check=False,
+                    )
+                else:
+                    password = password_provider()
+                    # `-S` consumes the password from stdin. This lets the UI
+                    # keep its screen active while using sudo's timestamp.
+                    validated = subprocess.run(
+                        ["sudo", "-S", "-p", "", "-v"],
+                        input=f"{password}\n",
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=terminal_env,
+                        check=False,
+                    )
+                if validated.returncode == 0:
+                    break
+                if attempt + 1 < SUDO_AUTH_ATTEMPTS:
+                    LOG.info("sudo password was rejected; retrying (%s/%s)", attempt + 1, SUDO_AUTH_ATTEMPTS - 1)
         if validated is None or validated.returncode != 0:
             detail = (getattr(validated, "stderr", "") or "").strip()
-            LAST_NETWORK_PREP_ERROR = f"sudo 认证失败（已重试 4 次）{': ' + detail if detail else ''}"
+            if allow_prompt:
+                LAST_NETWORK_PREP_ERROR = t("sshuttle.sudo_failed", detail=f": {detail}" if detail else "")
+            else:
+                LAST_NETWORK_PREP_ERROR = t("sshuttle.sudo_expired")
             LOG.error("%s; proxy will not start", LAST_NETWORK_PREP_ERROR)
             return False
         for command in NETWORK_PREP_COMMANDS:
@@ -93,7 +110,7 @@ def prepare_network_before_proxy(password_provider: Callable[[], str] | None = N
             # single sudo/PF diagnostic would corrupt the live screen.
             hidden_output = (
                 {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
-                if password_provider is not None
+                if password_provider is not None or not allow_prompt
                 else {}
             )
             result = subprocess.run(
@@ -101,13 +118,14 @@ def prepare_network_before_proxy(password_provider: Callable[[], str] | None = N
             )
             if result.returncode != 0:
                 detail = (getattr(result, "stderr", "") or "").strip()
-                LAST_NETWORK_PREP_ERROR = (
-                    f"{' '.join(command)} 失败{': ' + detail if detail else ''}"
+                LAST_NETWORK_PREP_ERROR = t(
+                    "sshuttle.command_failed",
+                    command=" ".join(command), detail=f": {detail}" if detail else "",
                 )
-                LOG.error("网络准备失败：%s", LAST_NETWORK_PREP_ERROR)
+                LOG.error("%s", t("sshuttle.network_prepare_failed", detail=LAST_NETWORK_PREP_ERROR))
                 return False
     except OSError as error:
-        LAST_NETWORK_PREP_ERROR = f"无法执行 sudo 网络准备：{error}"
+        LAST_NETWORK_PREP_ERROR = t("sshuttle.network_prepare_unavailable", error=error)
         LOG.error("%s", LAST_NETWORK_PREP_ERROR)
         return False
     return True
@@ -369,7 +387,13 @@ class SshuttleProcess:
                     return instance_name
         return None
 
-    def start(self, proxy: ProxyConfig, prepare_network: bool = True) -> bool:
+    def start(
+        self,
+        proxy: ProxyConfig,
+        prepare_network: bool = True,
+        allow_sudo_prompt: bool = True,
+        sudo_password_provider: Callable[[], str] | None = None,
+    ) -> bool:
         """Start Accessor's own sshuttle command without a project checkout."""
         global LAST_PROXY_START_ERROR
         LAST_PROXY_START_ERROR = None
@@ -379,8 +403,10 @@ class SshuttleProcess:
         self.log_path = Path("/tmp/accessor-demand-proxy.log")
         if self.is_alive():
             return True
-        if prepare_network and not prepare_network_before_proxy():
-            LAST_PROXY_START_ERROR = network_prepare_error() or "网络准备失败"
+        if prepare_network and not prepare_network_before_proxy(
+            password_provider=sudo_password_provider, allow_prompt=allow_sudo_prompt
+        ):
+            LAST_PROXY_START_ERROR = network_prepare_error() or t("sshuttle.network_prepare_failed", detail="")
             self._write_manager_error(LAST_PROXY_START_ERROR)
             return False
         try:

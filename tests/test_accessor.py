@@ -12,6 +12,7 @@ from unittest import mock
 import config
 import cli
 import console
+import i18n
 import permissions
 import sshuttle
 import scheduler
@@ -22,8 +23,29 @@ console.ACTIVITY_LOG = Path(tempfile.gettempdir()) / "accessor-test-activity.log
 
 
 class SettingsTest(unittest.TestCase):
+    @mock.patch("console.subprocess.run")
+    @mock.patch.dict("console.os.environ", {"TERM_PROGRAM": "Apple_Terminal"}, clear=False)
+    def test_password_prompt_activates_the_current_terminal_app(self, run: mock.Mock) -> None:
+        console.AccessorConsole._activate_terminal_window()
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["osascript", "-e", 'tell application "Terminal" to activate'],
+        )
+
     def test_cli_defaults_to_interactive_console(self) -> None:
         self.assertEqual(cli.parse_arguments([]).action, "console")
+
+    def test_cli_accepts_english_interface_language(self) -> None:
+        self.assertEqual(cli.parse_arguments(["--language", "en"]).language, "en")
+
+    def test_english_catalog_translates_console_status(self) -> None:
+        try:
+            i18n.set_language("en")
+            self.assertEqual(i18n.t("status.valid"), "Valid")
+            self.assertTrue(i18n.t("proxy.managed", health="").startswith("Running"))
+        finally:
+            i18n.set_language("zh")
 
     @mock.patch("console.RoleRefresher")
     def test_console_stops_before_proxy_when_foreground_role_refresh_fails(
@@ -530,6 +552,16 @@ class SshuttleProcessTest(unittest.TestCase):
         self.assertEqual(passwords.call_count, 5)
         self.assertIn("已重试 4 次", sshuttle.network_prepare_error() or "")
 
+    @mock.patch("sshuttle.subprocess.run")
+    def test_background_network_prepare_never_prompts_for_sudo(self, run: mock.Mock) -> None:
+        run.side_effect = [subprocess.CompletedProcess([], 0) for _ in range(4)]
+
+        self.assertTrue(sshuttle.prepare_network_before_proxy(allow_prompt=False))
+
+        self.assertEqual(run.call_args_list[0].args[0], ["sudo", "-n", "-v"])
+        self.assertEqual(run.call_args_list[1].args[0], ["sudo", "-n", "dscacheutil", "-flushcache"])
+        self.assertNotIn("input", run.call_args_list[0].kwargs)
+
     def test_liveness_is_just_a_process_poll(self) -> None:
         manager = sshuttle.SshuttleProcess()
         process = mock.Mock()
@@ -541,7 +573,7 @@ class SshuttleProcessTest(unittest.TestCase):
 
 
 class SchedulerThreadTest(unittest.TestCase):
-    def test_unhealthy_external_proxy_is_taken_over_and_restarted(self) -> None:
+    def test_proxy_failure_notifies_once_until_a_health_probe_recovers(self) -> None:
         project = config.ProjectConfig(
             name="fprpapi", description="", service_name="fprpapi",
             depends_on_role=None, credential_refresh_seconds=2700,
@@ -555,7 +587,40 @@ class SchedulerThreadTest(unittest.TestCase):
             default_proxy="fprpapi", roles=(), projects=(project,),
             proxy_health_urls=("https://private/health",),
         )
-        worker = scheduler.RefreshScheduler(settings, (project,), project, manage_proxy=False)
+        notification = mock.Mock()
+        worker = scheduler.RefreshScheduler(
+            settings, (project,), project, proxy_failure_notifier=notification
+        )
+        worker.sshuttle.is_alive = mock.Mock(return_value=True)
+        worker.sshuttle.stop = mock.Mock()
+        worker.sshuttle.start = mock.Mock(return_value=True)
+        worker.sshuttle.check_health = mock.Mock(side_effect=((0, 1), (0, 1), (1, 1), (0, 1)))
+
+        with mock.patch.object(scheduler.LOG, "warning"):
+            for now in (0.0, 100.0, 200.0, 600.0):
+                worker._check_sshuttle(now)
+
+        self.assertEqual(notification.call_count, 2)
+
+    def test_unhealthy_external_proxy_is_taken_over_and_restarted(self) -> None:
+        project = config.ProjectConfig(
+            name="fprpapi", description="", service_name="fprpapi",
+            depends_on_role=None, credential_refresh_seconds=2700,
+            credential_retry_seconds=60, restart_delay_seconds=10, shutdown_grace_seconds=15,
+        )
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=True, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=("fprpapi",),
+            default_proxy="fprpapi", roles=(), projects=(project,),
+            proxy_health_urls=("https://private/health",),
+        )
+        password_prompt = mock.Mock(return_value="not-a-real-password")
+        worker = scheduler.RefreshScheduler(
+            settings, (project,), project, manage_proxy=False,
+            sudo_password_provider=password_prompt,
+        )
         worker.role_ready = {}
         worker.sshuttle.check_health = mock.Mock(return_value=(0, 1))
         worker.sshuttle.find_external_proxy_pids = mock.Mock(return_value=(123,))
@@ -567,7 +632,13 @@ class SchedulerThreadTest(unittest.TestCase):
 
         self.assertTrue(worker.manage_proxy)
         worker.sshuttle.stop_external_proxy.assert_called_once_with((123,))
-        worker.sshuttle.start.assert_called_once_with(settings.proxy, prepare_network=False)
+        worker.sshuttle.start.assert_called_once_with(
+            settings.proxy,
+            prepare_network=True,
+            allow_sudo_prompt=True,
+            sudo_password_provider=password_prompt,
+        )
+        self.assertEqual(worker.next_sshuttle_check, 160.0)
 
     def test_proxy_start_does_not_delay_connector_first_refresh(self) -> None:
         project = config.ProjectConfig(
@@ -588,15 +659,19 @@ class SchedulerThreadTest(unittest.TestCase):
             default_proxy="fprpapi", roles=(), projects=(project,),
         )
         worker = scheduler.RefreshScheduler(settings, (project,), project)
+        events: list[str] = []
         with (
-            mock.patch.object(worker, "_check_sshuttle"),
-            mock.patch.object(worker, "_start_due_projects") as start_projects,
+            mock.patch.object(worker, "_check_sshuttle", side_effect=lambda _now: events.append("proxy")),
+            mock.patch.object(
+                worker, "_start_due_projects", side_effect=lambda _now: events.append("projects")
+            ) as start_projects,
         ):
             worker.sshuttle.is_alive = mock.Mock(return_value=True)
             worker._initial_refreshes(123.0)
 
         self.assertEqual(worker.next_credential_refresh["fprpapi"], 0.0)
         start_projects.assert_called_once()
+        self.assertEqual(events, ["projects", "proxy"])
 
     def test_scheduler_keeps_auto_role_renewal_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

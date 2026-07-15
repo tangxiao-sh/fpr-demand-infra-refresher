@@ -14,12 +14,14 @@ import traceback
 from typing import Any, Callable, Sequence
 
 from config import ProjectConfig, RoleConfig, Settings
+from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, run_project_refresh
 from sshuttle import SshuttleProcess, proxy_start_error
 
 
 LOG = logging.getLogger("accessor.scheduler")
 StatusReporter = Callable[[str, str, str, str], None]
+ProxyFailureNotifier = Callable[[], None]
 SCHEDULER_LOG = Path("/tmp/accessor-scheduler.log")
 LOCK_CONFLICT_EXIT_CODE = 2
 
@@ -68,11 +70,21 @@ class RefreshScheduler:
         proxy_project: ProjectConfig | None,
         status_reporter: StatusReporter | None = None,
         manage_proxy: bool = True,
+        network_prepared: bool = False,
+        sudo_password_provider: Callable[[], str] | None = None,
+        proxy_failure_notifier: ProxyFailureNotifier | None = None,
     ):
         self.settings = settings
         self.projects = tuple(projects)
         self.proxy_project = proxy_project
         self.manage_proxy = manage_proxy
+        self.network_prepared = network_prepared
+        # The prompt_toolkit console implements this callback by switching the
+        # current screen to a hidden password field. Command-line mode leaves
+        # it unset, so a background job can never read from terminal stdin.
+        self.sudo_password_provider = sudo_password_provider
+        self.proxy_failure_notifier = proxy_failure_notifier
+        self._proxy_failure_notified = False
         # Keep automatic Granted output out of the console. The request still
         # runs with the exact configured role and is verified afterwards; its
         # diagnostics remain available in this local log.
@@ -106,6 +118,18 @@ class RefreshScheduler:
         except Exception:
             LOG.exception("Unable to publish %s status for %s", kind, name)
 
+    def _notify_proxy_failure_once(self) -> None:
+        """Notify only when the proxy newly enters a total health failure."""
+        if self._proxy_failure_notified:
+            return
+        self._proxy_failure_notified = True
+        if self.proxy_failure_notifier is None:
+            return
+        try:
+            self.proxy_failure_notifier()
+        except Exception:
+            LOG.exception("Unable to show Demand Proxy failure notification")
+
     def _request_stop(self, signum: int, _frame: Any) -> None:
         LOG.info("Received signal %s; shutting down", signum)
         self.stop_requested = True
@@ -131,7 +155,7 @@ class RefreshScheduler:
                 role.refresh_seconds if ready else role.retry_seconds
             )
         self._report_status(
-            "role", role.name, "有效" if ready else "失效", self.roles.last_action
+            "role", role.name, t("status.valid") if ready else t("status.invalid"), self.roles.last_action
         )
 
     def _schedule_credential(self, project: ProjectConfig, now: float, success: bool) -> None:
@@ -144,7 +168,7 @@ class RefreshScheduler:
         if not self._project_role_ready(project):
             LOG.warning("Project %s is waiting for role %s", project.name, project.depends_on_role)
             self._report_status(
-                "project", project.name, f"等待权限 {project.depends_on_role}", "等待"
+                "project", project.name, t("scheduler.wait_role", role=project.depends_on_role), t("action.wait")
             )
             self._schedule_credential(project, now, success=False)
             return
@@ -154,7 +178,7 @@ class RefreshScheduler:
         with self._credential_write_lock:
             refreshed = run_project_refresh(self.settings, project)
         self._report_status(
-            "project", project.name, "有效" if refreshed else "刷新失败", "刷新"
+            "project", project.name, t("status.valid") if refreshed else t("status.refresh_failed"), t("action.refresh")
         )
         # Count the interval from completion: a slow credential process must
         # not make the same project immediately due again.
@@ -225,20 +249,23 @@ class RefreshScheduler:
             return
         if not self.manage_proxy:
             healthy, total = self.sshuttle.check_health(self.settings.proxy_health_urls)
+            if healthy:
+                self._proxy_failure_notified = False
             if total and healthy == 0:
+                self._notify_proxy_failure_once()
                 external_pids = self.sshuttle.find_external_proxy_pids()
                 if external_pids:
                     self._report_status(
                         "proxy", "demand",
-                        f"不可用（外部 Proxy 健康检查 0/{total}，正在接管重启）",
-                        "接管",
+                        t("scheduler.external_takeover", total=total),
+                        t("action.takeover"),
                     )
                     remaining = self.sshuttle.stop_external_proxy(external_pids)
                     if remaining:
                         self._report_status(
                             "proxy", "demand",
-                            f"接管等待外部进程退出：{', '.join(map(str, remaining))}",
-                            "重启",
+                            t("scheduler.external_wait_exit", pids=", ".join(map(str, remaining))),
+                            t("action.restart"),
                         )
                         self.next_sshuttle_check = now + project.restart_delay_seconds
                         return
@@ -246,36 +273,40 @@ class RefreshScheduler:
                 self.manage_proxy = True
             else:
                 if total and healthy < total:
-                    status = f"运行中（外部 Proxy，部分健康 {healthy}/{total}）"
+                    status = t("scheduler.external_partial", healthy=healthy, total=total)
                 elif total:
-                    status = f"运行中（外部 Proxy，健康 {healthy}/{total}）"
+                    status = t("scheduler.external_healthy", healthy=healthy, total=total)
                 else:
-                    status = "运行中（外部 Proxy，未配置健康检查）"
-                self._report_status("proxy", "demand", status, "检查")
+                    status = t("scheduler.external_no_health")
+                self._report_status("proxy", "demand", status, t("action.check"))
                 self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
                 return
         if self.sshuttle.is_alive():
             healthy, total = self.sshuttle.check_health(self.settings.proxy_health_urls)
+            if healthy:
+                self._proxy_failure_notified = False
             if total and healthy == 0:
+                self._notify_proxy_failure_once()
                 LOG.warning("sshuttle for %s failed every health probe; restarting", project.name)
                 self._report_status(
-                    "proxy", "demand", f"不可用（健康检查 0/{total}，正在重启）", "重启"
+                    "proxy", "demand", t("scheduler.restarting", total=total), t("action.restart")
                 )
                 self.sshuttle.stop(project)
+                self.network_prepared = False
             else:
                 LOG.debug("sshuttle for %s is alive", project.name)
-                health = f"（健康 {healthy}/{total}）" if total else ""
+                health = t("proxy.health", healthy=healthy, total=total) if total else ""
                 if total and healthy < total:
-                    health = f"（部分健康 {healthy}/{total}）"
+                    health = t("proxy.partial_health", healthy=healthy, total=total)
                 self._report_status(
-                    "proxy", "demand", f"运行中（Accessor 管理）{health}", "检查"
+                    "proxy", "demand", t("proxy.managed", health=health), t("action.check")
                 )
                 self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
                 return
         if not self._project_role_ready(project):
             LOG.warning("sshuttle for %s waits for role %s", project.name, project.depends_on_role)
             self._report_status(
-                "proxy", "demand", f"等待权限 {project.depends_on_role}", "等待"
+                "proxy", "demand", t("scheduler.wait_role", role=project.depends_on_role), t("action.wait")
             )
             self.next_sshuttle_check = now + project.restart_delay_seconds
             return
@@ -284,27 +315,33 @@ class RefreshScheduler:
         # The tunnel only uses the configured jump-role AWS profile; selected
         # service profiles are refreshed by the separate project worker below.
         started = self.sshuttle.start(
-            self.settings.proxy, prepare_network=self.settings.prepare_network_before_proxy
+            self.settings.proxy,
+            prepare_network=(
+                self.settings.prepare_network_before_proxy and not self.network_prepared
+            ),
+            allow_sudo_prompt=self.sudo_password_provider is not None,
+            sudo_password_provider=self.sudo_password_provider,
         )
-        # A child process being created does not prove traffic can pass.
-        # Verify a newly started or taken-over tunnel once after its short
-        # restart delay, then use the normal long health-check interval.
-        self.next_sshuttle_check = now + project.restart_delay_seconds
         if started:
-            proxy_status = "启动中（等待健康检查）"
+            self.network_prepared = True
+        # SSM-backed SSH startup can take noticeably longer than a normal
+        # process restart. Do not kill a tunnel that is still connecting; wait
+        # at least one minute before its first health check.
+        self.next_sshuttle_check = now + max(60, project.restart_delay_seconds)
+        if started:
+            proxy_status = t("scheduler.starting")
         else:
             reason = proxy_start_error()
-            proxy_status = f"启动失败（将重试）：{reason}" if reason else "启动失败（将重试）"
-        self._report_status("proxy", "demand", proxy_status, "启动" if started else "重启")
+            proxy_status = t("scheduler.start_failed", reason=reason) if reason else t("scheduler.start_failed_generic")
+        self._report_status("proxy", "demand", proxy_status, t("action.start") if started else t("action.restart"))
 
     def _initial_refreshes(self, now: float) -> None:
-        """Start the tunnel once and queue every selected service refresh."""
-        self._check_sshuttle(now)
-        # Proxy startup only establishes a route. It never refreshes the
-        # connector service profile, so leave its initial due time untouched.
-        # The project worker below will refresh it alongside every other
-        # selected service profile.
+        """Queue credentials immediately; Proxy startup must not delay them."""
+        # Creating the project worker is non-blocking. Do it before SSM/EC2
+        # discovery and sshuttle startup, which can take minutes while a proxy
+        # instance is waking up or an SSH connection is being established.
         self._start_due_projects(now)
+        self._check_sshuttle(now)
 
     def _sleep(self, now: float) -> None:
         with self._schedule_lock:
@@ -316,8 +353,8 @@ class RefreshScheduler:
 
     def _record_fatal_error(self, error: BaseException) -> None:
         """Make a background failure visible even when UI logging is muted."""
-        message = f"刷新 job 已停止：{type(error).__name__}: {error}"
-        self._report_status("job", "refresh", message, "失败")
+        message = t("scheduler.job_stopped", type=type(error).__name__, error=error)
+        self._report_status("job", "refresh", message, t("action.failure"))
         try:
             with SCHEDULER_LOG.open("a", encoding="utf-8") as log_file:
                 log_file.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
