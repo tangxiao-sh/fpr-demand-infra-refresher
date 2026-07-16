@@ -36,6 +36,16 @@ class SettingsTest(unittest.TestCase):
     def test_cli_defaults_to_interactive_console(self) -> None:
         self.assertEqual(cli.parse_arguments([]).action, "console")
 
+    def test_startup_selects_all_projects_before_enabling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            with mock.patch.object(panel, "_start_enable_from_prompt") as start:
+                panel._start_all_projects_on_boot()
+
+        self.assertEqual(panel.selected_names, [project.name for project in settings.projects])
+        start.assert_called_once()
+
     def test_cli_accepts_english_interface_language(self) -> None:
         self.assertEqual(cli.parse_arguments(["--language", "en"]).language, "en")
 

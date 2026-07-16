@@ -36,9 +36,9 @@ Start the console:
 ./accessor
 ```
 
-To start refreshes for every configured project with the default selection,
-enter `2`, press Enter, then press Enter again at the project-selection prompt.
-The second empty Enter means **all projects**.
+Accessor immediately selects **all configured projects** and starts the normal
+Start / refresh flow. No menu input is needed. If Granted or `sudo` requires a
+password, the console switches to a secure hidden-input prompt in this window.
 
 The default interface language is Chinese. Use English when needed:
 
@@ -54,8 +54,8 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
 - `1` — Check roles, selected project credentials, and Proxy health without
   changing credentials or starting a proxy. If a problem is found, Accessor
   offers to start or refresh it.
-- `2` — Start or refresh. Enter project numbers such as `1,3`; an empty value
-  selects every configured project.
+- `2` — Run Start / refresh again. Enter project numbers such as `1,3`; an
+  empty value selects every configured project.
 - `3` — Stop the automatic refresh job and the Accessor-managed Demand Proxy.
   Existing AWS credentials are left on disk.
 - `q` — Exit the console. This also stops the active refresh job.

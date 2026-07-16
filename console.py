@@ -226,6 +226,19 @@ class AccessorConsole:
         known = self.settings.projects_by_name
         return [known[name] for name in self.selected_names if name in known]
 
+    def _select_all_projects(self) -> None:
+        """Use every configured project for an explicit empty selection or startup."""
+        self.selected_names = [project.name for project in self.settings.projects]
+
+    def _start_all_projects_on_boot(self) -> None:
+        """Start the normal refresh flow immediately after the UI becomes usable.
+
+        This intentionally reuses the same worker as menu action 2, so startup
+        has identical role, sudo-password, Proxy, and status handling.
+        """
+        self._select_all_projects()
+        self._start_enable_from_prompt()
+
     def _choose_projects(self) -> None:
         print(f"\n{t('console.projects_header')}")
         for index, project in enumerate(self.settings.projects, start=1):
@@ -233,7 +246,7 @@ class AccessorConsole:
             print(f"  {index}. [{mark}] {project.name}")
         raw = self._read_line(t("console.project_input")).strip()
         if not raw:
-            self.selected_names = [project.name for project in self.settings.projects]
+            self._select_all_projects()
             return
         try:
             indexes = {int(value.strip()) for value in raw.split(",")}
@@ -759,7 +772,7 @@ class AccessorConsole:
             else:
                 # Empty means "all" for both check and enable/refresh. This
                 # makes an explicit project number an opt-in narrowing action.
-                self.selected_names = [project.name for project in self.settings.projects]
+                self._select_all_projects()
             if mode == "check_projects":
                 with self._status_lock:
                     self._ui_mode = "status"
@@ -809,9 +822,10 @@ class AccessorConsole:
         app = Application(layout=Layout(HSplit([status, input_area])), full_screen=True)
         self._app = app
         self._ui_active = True
-        # Do not perform network/AWS checks merely by opening the console.
-        # Use menu option 1 when an explicit status check is wanted.
-        # self._start_status_refresh()
+        # A terminal launch starts the same all-project refresh flow as menu
+        # action 2 followed by an empty project selection. The worker begins
+        # only after prompt_toolkit owns stdin, so password prompts stay safe.
+        self._start_all_projects_on_boot()
         try:
             app.run()
         finally:
@@ -828,8 +842,10 @@ class AccessorConsole:
     def run(self) -> int:
         if sys.stdin.isatty() and sys.stdout.isatty():
             return self._run_prompt_toolkit()
-        # Startup is intentionally passive; explicit option 1 performs checks.
-        # self._start_status_refresh()
+        # Keep the non-UI fallback consistent with a regular terminal launch.
+        # It uses normal terminal password prompts instead of prompt_toolkit.
+        self._select_all_projects()
+        self.enable_or_refresh(choose_projects=False)
         while True:
             self.show_status()
             choice = self._read_line(t("console.choice")).strip().lower()
