@@ -13,6 +13,7 @@ import time
 from typing import Any, Sequence
 
 from config import ProjectConfig, RoleConfig, Settings
+from build_artifacts import refresh_build_artifacts
 from credentials import refresh_service_credentials
 from i18n import t
 
@@ -82,6 +83,17 @@ class RoleRefresher:
     def _aliases_available(self, role: RoleConfig) -> bool:
         return all(self._check_profile(alias) for alias in role.credential_aliases)
 
+    def _finish_refresh(self, role: RoleConfig, role_ready: bool) -> bool:
+        """Refresh Gradle build access after its underlying AWS role is ready."""
+        artifacts = self.settings.build_artifacts
+        if not role_ready or not artifacts.enabled or role.name != artifacts.role_name:
+            return role_ready
+        # A CodeArtifact token is separate from AWS credentials and is read by
+        # Gradle from ~/.gradle/gradle.properties. Refresh it on every build
+        # role cycle, including cycles where the AWS session was still valid.
+        self.last_action = t("action.refresh")
+        return refresh_build_artifacts(self.settings)
+
     @staticmethod
     def _sync_credential_aliases(role: RoleConfig) -> bool:
         """Copy a refreshed session into legacy profiles used by local build tools.
@@ -146,18 +158,20 @@ class RoleRefresher:
                 )
                 return False
             self.last_action = t("action.refresh")
-            return (
+            return self._finish_refresh(role, (
                 self._copy_credential_profiles(role.credential_source_profile, (role.profile,))
                 and self._check_profile(role.profile)
-            )
+            ))
         primary_ready = self._check_profile(role.profile)
         if primary_ready and self._aliases_available(role):
-            return True
+            return self._finish_refresh(role, True)
         if primary_ready:
             # The role itself is valid, but a legacy profile used by a build
             # tool has expired. Re-export the same session into that alias.
             self.last_action = t("action.refresh")
-            return self._sync_credential_aliases(role) and self._aliases_available(role)
+            return self._finish_refresh(
+                role, self._sync_credential_aliases(role) and self._aliases_available(role)
+            )
         if not (
             self.settings.auto_request
             and role.request_on_failure
@@ -184,7 +198,9 @@ class RoleRefresher:
         if not self.dry_run:
             time.sleep(self.settings.post_request_delay_seconds)
         if self._check_profile(role.profile):
-            return self._sync_credential_aliases(role) and self._aliases_available(role)
+            return self._finish_refresh(
+                role, self._sync_credential_aliases(role) and self._aliases_available(role)
+            )
 
         # The initial/retry probes are quiet to keep the menu readable. If a
         # request did complete but credentials still fail, show AWS's precise

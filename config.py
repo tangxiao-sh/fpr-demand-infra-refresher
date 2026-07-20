@@ -80,6 +80,23 @@ class ProxyConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class BuildArtifactsConfig:
+    """Local Gradle and Docker access derived from the build-role session."""
+
+    # Keep this disabled unless explicitly configured. Existing user configs
+    # therefore retain their previous behavior when upgrading Accessor.
+    enabled: bool = False
+    role_name: str = "build-artifact-reader"
+    profile: str = "beiartf"
+    region: str = "ap-southeast-1"
+    codeartifact_domain: str = ""
+    codeartifact_domain_owner: str = ""
+    gradle_property: str = "external_cache_codeartifact_token"
+    gradle_properties_path: Path = Path("~/.gradle/gradle.properties")
+    ecr_registry_ids: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
 class Settings:
     """Global configuration plus every project selectable by the CLI."""
 
@@ -96,6 +113,7 @@ class Settings:
     roles: tuple[RoleConfig, ...]
     projects: tuple[ProjectConfig, ...]
     proxy: ProxyConfig = ProxyConfig()
+    build_artifacts: BuildArtifactsConfig = BuildArtifactsConfig()
     # Private endpoints that prove sshuttle forwarding works end to end.
     proxy_health_urls: tuple[str, ...] = ()
     # A service credential operation is isolated in a worker. Its shorter
@@ -264,6 +282,49 @@ def _read_projects(
     return tuple(projects)
 
 
+def _read_build_artifacts(document: dict[str, Any]) -> BuildArtifactsConfig:
+    """Read optional Gradle CodeArtifact and ECR settings for build access."""
+    entry = document.get("build_artifacts", {})
+    if not isinstance(entry, dict):
+        raise ConfigError("[build_artifacts] must be a table")
+    enabled = entry.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("build_artifacts.enabled must be true or false")
+    defaults = BuildArtifactsConfig()
+    default_values = {
+        "role_name": defaults.role_name,
+        "profile": defaults.profile,
+        "region": defaults.region,
+        "codeartifact_domain": defaults.codeartifact_domain,
+        "codeartifact_domain_owner": defaults.codeartifact_domain_owner,
+        "gradle_property": defaults.gradle_property,
+        "gradle_properties_path": str(defaults.gradle_properties_path),
+    }
+    values = {field: entry.get(field, value) for field, value in default_values.items()}
+    required_fields = set(values) - {"codeartifact_domain", "codeartifact_domain_owner"}
+    if enabled:
+        required_fields.update({"codeartifact_domain", "codeartifact_domain_owner"})
+    for field, value in values.items():
+        if field not in required_fields:
+            continue
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"build_artifacts.{field} must be a non-empty string")
+    registry_ids = _string_list(
+        entry.get("ecr_registry_ids"), "build_artifacts.ecr_registry_ids"
+    )
+    return BuildArtifactsConfig(
+        enabled=enabled,
+        role_name=values["role_name"],
+        profile=values["profile"],
+        region=values["region"],
+        codeartifact_domain=values["codeartifact_domain"],
+        codeartifact_domain_owner=values["codeartifact_domain_owner"],
+        gradle_property=values["gradle_property"],
+        gradle_properties_path=Path(values["gradle_properties_path"]).expanduser(),
+        ecr_registry_ids=registry_ids,
+    )
+
+
 def load_settings(config_path: Path) -> Settings:
     """Load TOML and validate only static values; this does not access AWS."""
     path = config_path.expanduser().resolve()
@@ -280,6 +341,9 @@ def load_settings(config_path: Path) -> Settings:
         raise ConfigError("[general] must be a table")
     roles = _read_roles(document)
     projects = _read_projects(document, {role.name for role in roles})
+    build_artifacts = _read_build_artifacts(document)
+    if build_artifacts.enabled and build_artifacts.role_name not in {role.name for role in roles}:
+        raise ConfigError("build_artifacts.role_name must refer to a configured role")
     project_names = {project.name for project in projects}
 
     auto_request = general.get("auto_request", True)
@@ -362,6 +426,7 @@ def load_settings(config_path: Path) -> Settings:
         roles=roles,
         projects=projects,
         proxy=proxy,
+        build_artifacts=build_artifacts,
         proxy_health_urls=_string_list(
             general.get("proxy_health_urls"), "general.proxy_health_urls"
         ),

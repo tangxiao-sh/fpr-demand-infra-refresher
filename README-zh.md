@@ -56,12 +56,15 @@ assume --help
 1. **AWS 角色**：先检查配置的角色。若角色不可用，会以精确 profile 执行配置中的 Granted
    命令（`assume --wait --export PROFILE`），随后验证该 AWS profile。构建角色、Gradle 使用的
    `beiartf` 旧 profile，以及本地 staging jump role 分别独立维护。
-2. **Demand Proxy**：从 `accessor.toml` 配置的 SSM mapping 中解析共享 proxy 主机，然后为所有
+2. **构建制品**：每次 build role 成功刷新后，都会更新
+   `~/.gradle/gradle.properties` 中的 Gradle CodeArtifact token。若 Docker 可用，也会更新配置的
+   ECR registry 登录；Docker 登录失败不会将有效 AWS 角色标记为失效。
+3. **Demand Proxy**：从 `accessor.toml` 配置的 SSM mapping 中解析共享 proxy 主机，然后为所有
    已选项目建立一个 `sshuttle` 隧道。新建隧道前会在当前终端请求 `sudo` 密码，并执行 DNS/PF
    网络准备命令；密码不会回显。
-3. **项目凭证**：每个所选服务的凭证独立刷新。正常刷新间隔为 45 分钟；失败后按配置的重试
+4. **项目凭证**：每个所选服务的凭证独立刷新。正常刷新间隔为 45 分钟；失败后按配置的重试
    间隔执行。刷新凭证不会重启健康的 Proxy。
-4. **持续检查**：角色每 10 分钟检查一次；Proxy 每 5 分钟通过配置的私有健康检查地址验证。
+5. **持续检查**：角色每 10 分钟检查一次；Proxy 每 5 分钟通过配置的私有健康检查地址验证。
    如果由 Accessor 管理的隧道全部健康检查失败，会自动重启；外部启动但已失效的隧道会先被接管
    再替换。
 

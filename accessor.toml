@@ -31,6 +31,23 @@ proxy_health_urls = [
 default_projects = ["fprpapi"]
 default_proxy = "fprpapi"
 
+[build_artifacts]
+# Keep Gradle's CodeArtifact token synchronized with the build role. This is
+# the Accessor equivalent of the shared projects' scripts/dev_login.sh.
+enabled = true
+role_name = "build-artifact-reader"
+# Use the source build profile. The legacy `beiartf` profile is synchronized by
+# the following gradle-beiartf role and may not exist at the first startup step.
+profile = "BeiartfReader@tvlk-build-special"
+region = "ap-southeast-1"
+codeartifact_domain = "org-codeartifact-domain-015110552125-242c507c3f"
+codeartifact_domain_owner = "015110552125"
+gradle_property = "external_cache_codeartifact_token"
+gradle_properties_path = "~/.gradle/gradle.properties"
+# Used for `docker pull` / local image work. Docker login is best effort and
+# does not mark an otherwise valid AWS build role as unavailable.
+ecr_registry_ids = ["015110552125", "745412875337"]
+
 [proxy]
 # Shared Demand Proxy parameters.  These values came from the common project
 # scripts; Accessor uses them directly and never imports a project checkout.
@@ -131,5 +148,11 @@ credential_refresh_seconds = 2700
 name = "fprbpf"
 description = "fprbpf service credentials"
 service_name = "fprbpf"
+depends_on_role = "local-staging-jump"
+credential_refresh_seconds = 2700
+
+[[projects]]
+name = "fprmfdt"
+description = "fprmfdt service credentials"
 depends_on_role = "local-staging-jump"
 credential_refresh_seconds = 2700

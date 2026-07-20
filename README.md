@@ -67,15 +67,19 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
    profile (`assume --wait --export PROFILE`) and verifies the resulting AWS
    profile. The build role, its legacy `beiartf` Gradle profile, and the local
    staging jump role are handled independently.
-2. **Demand Proxy** — Accessor resolves the shared proxy host from the SSM
+2. **Build artifacts** — Each successful build-role cycle refreshes Gradle's
+   CodeArtifact token in `~/.gradle/gradle.properties`. It also renews Docker
+   login for the configured ECR registries when Docker is available; an
+   optional Docker-login failure does not invalidate the AWS role.
+3. **Demand Proxy** — Accessor resolves the shared proxy host from the SSM
    mapping in `accessor.toml`, then starts one `sshuttle` tunnel for all selected
    services. Before a new tunnel it asks for the terminal `sudo` password and
    runs the required DNS/PF preparation commands. The password is not echoed.
-3. **Project credentials** — Each selected service credential profile is
+4. **Project credentials** — Each selected service credential profile is
    refreshed independently. Their normal cadence is 45 minutes; a failed
    refresh uses the configured retry interval. Updating credentials does not
    restart a healthy Proxy.
-4. **Ongoing health** — Roles are checked every 10 minutes. The Proxy is health
+5. **Ongoing health** — Roles are checked every 10 minutes. The Proxy is health
    checked every five minutes using the configured private endpoints. If an
    Accessor-managed tunnel has failed every probe, Accessor restarts it; an
    unhealthy external tunnel is taken over before replacement.

@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import config
+import build_artifacts
 import cli
 import console
 import i18n
@@ -254,6 +255,12 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual([project.name for project in selected], ["papi", "cinv"])
         self.assertEqual(proxy.name, "papi")
 
+    def test_production_config_includes_build_artifacts_and_fprmfdt(self) -> None:
+        settings = config.load_settings(Path(__file__).parents[1] / "accessor.toml")
+
+        self.assertTrue(settings.build_artifacts.enabled)
+        self.assertIn("fprmfdt", settings.projects_by_name)
+
     def test_allows_shared_default_proxy_connector_without_selecting_its_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = config.load_settings(self.write_config(Path(temporary)))
@@ -275,6 +282,66 @@ class SettingsTest(unittest.TestCase):
 
 
 class PermissionsTest(unittest.TestCase):
+    @mock.patch("permissions.refresh_build_artifacts", return_value=True)
+    def test_build_role_refreshes_gradle_access(self, refresh_artifacts: mock.Mock) -> None:
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=True,
+            request_command=("assume", "--wait", "--export"), command_timeout_seconds=30,
+            post_request_delay_seconds=1, prepare_network_before_proxy=True,
+            sshuttle_check_seconds=300, lock_file=Path("/tmp/accessor.lock"),
+            default_projects=(), default_proxy=None, roles=(), projects=(),
+            build_artifacts=config.BuildArtifactsConfig(
+                enabled=True, role_name="build", profile="beiartf",
+                codeartifact_domain="domain", codeartifact_domain_owner="owner",
+            ),
+        )
+        role = config.RoleConfig("build", "BuildRole@example", 600, 60, True)
+        refresher = permissions.RoleRefresher(settings)
+        with mock.patch.object(refresher, "_check_profile", return_value=True):
+            self.assertTrue(refresher.refresh(role))
+
+        refresh_artifacts.assert_called_once_with(settings)
+
+
+class CredentialAndArtifactTest(unittest.TestCase):
+    @mock.patch("build_artifacts.boto3.Session")
+    def test_refresh_writes_codeartifact_token_to_gradle_properties(
+        self, session_class: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gradle_properties = Path(temporary) / "gradle.properties"
+            gradle_properties.write_text("org.gradle.caching=true\n", encoding="utf-8")
+            artifacts = config.BuildArtifactsConfig(
+                enabled=True,
+                profile="beiartf",
+                codeartifact_domain="domain",
+                codeartifact_domain_owner="owner",
+                gradle_properties_path=gradle_properties,
+            )
+            settings = self._settings_with_artifacts(artifacts)
+            codeartifact = mock.Mock()
+            codeartifact.get_authorization_token.return_value = {"authorizationToken": "token"}
+            session = session_class.return_value
+            session.client.return_value = codeartifact
+
+            self.assertTrue(build_artifacts.refresh_build_artifacts(settings))
+
+            written = gradle_properties.read_text(encoding="utf-8")
+        self.assertIn("org.gradle.caching=true", written)
+        self.assertIn("external_cache_codeartifact_token=token", written)
+        session_class.assert_called_once_with(profile_name="beiartf", region_name="ap-southeast-1")
+
+    @staticmethod
+    def _settings_with_artifacts(artifacts: config.BuildArtifactsConfig) -> config.Settings:
+        return config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=True,
+            request_command=("assume",), command_timeout_seconds=30,
+            post_request_delay_seconds=1, prepare_network_before_proxy=True,
+            sshuttle_check_seconds=300, lock_file=Path("/tmp/accessor.lock"),
+            default_projects=(), default_proxy=None, roles=(), projects=(),
+            build_artifacts=artifacts,
+        )
+
     def test_syncs_build_session_into_legacy_gradle_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
