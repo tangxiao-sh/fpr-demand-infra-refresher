@@ -48,6 +48,7 @@ assume --help
 - `1`：只检查角色、所选项目凭证和 Proxy 健康状态，不会修改凭证或启动 Proxy。发现问题后会
   询问是否开启或刷新。
 - `2`：再次执行开启或刷新。可输入项目编号，例如 `1,3`；直接回车表示选择全部已配置项目。
+  选择多个项目时，输入的第一个项目决定 Demand Proxy 分组。
 - `3`：停止自动刷新 job 和由 Accessor 管理的 Demand Proxy；已写入磁盘的 AWS 凭证不会删除。
 - `q`：退出控制台，同时停止当前刷新 job。
 
@@ -59,9 +60,10 @@ assume --help
 2. **构建制品**：每次 build role 成功刷新后，都会更新
    `~/.gradle/gradle.properties` 中的 Gradle CodeArtifact token。若 Docker 可用，也会更新配置的
    ECR registry 登录；Docker 登录失败不会将有效 AWS 角色标记为失效。
-3. **Demand Proxy**：从 `accessor.toml` 配置的 SSM mapping 中解析共享 proxy 主机，然后为所有
-   已选项目建立一个 `sshuttle` 隧道。新建隧道前会在当前终端请求 `sudo` 密码，并执行 DNS/PF
-   网络准备命令；密码不会回显。
+3. **Demand Proxy**：从 `accessor.toml` 配置的 SSM mapping 中按第一个所选项目解析 proxy
+   分组，并建立一个 `sshuttle` 隧道。下一次选择仍属于同一分组时会复用现有隧道；属于不同分组时，
+   Accessor 会停止当前隧道并启动对应分组。切换或新建前会在当前终端请求 `sudo` 密码，并执行
+   DNS/PF 网络准备命令；密码不会回显。
 4. **项目凭证**：每个所选服务的凭证独立刷新。正常刷新间隔为 45 分钟；失败后按配置的重试
    间隔执行。刷新凭证不会重启健康的 Proxy。
 5. **持续检查**：角色每 10 分钟检查一次；Proxy 每 5 分钟通过配置的私有健康检查地址验证。

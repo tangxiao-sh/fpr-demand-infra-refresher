@@ -14,11 +14,11 @@ import time
 from typing import Callable
 from pathlib import Path
 
-from config import ProjectConfig, Settings
+from config import ProjectConfig, ProxyConfig, Settings
 from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, check_project_credentials, run_project_refresh
 from scheduler import LOCK_CONFLICT_EXIT_CODE, RefreshScheduler
-from sshuttle import network_prepare_error, prepare_network_before_proxy
+from sshuttle import SshuttleProcess, network_prepare_error, prepare_network_before_proxy
 
 
 LOG = logging.getLogger("accessor.console")
@@ -226,6 +226,30 @@ class AccessorConsole:
         known = self.settings.projects_by_name
         return [known[name] for name in self.selected_names if name in known]
 
+    def _selected_proxy(
+        self, projects: list[ProjectConfig]
+    ) -> tuple[ProjectConfig, ProxyConfig, str]:
+        """Resolve the first selected project's Demand Proxy group.
+
+        sshuttle owns system-wide PF and DNS rules, so only one tunnel can be
+        active.  For a multi-project selection, preserving the displayed
+        project order gives the user a deterministic tunnel choice.
+        """
+        project = projects[0]
+        proxy = dataclasses.replace(
+            self.settings.proxy, service_name=project.service_name
+        )
+        return project, proxy, SshuttleProcess.resolve_proxy_group(proxy)
+
+    def _show_proxy_resolution_error(self, error: Exception) -> None:
+        """Show a mapping failure without stopping the currently working tunnel."""
+        message = t("console.proxy_resolution_failed", error=error)
+        if self._ui_active:
+            self._ui_message = message
+        else:
+            print(message)
+            self._read_line(t("console.press_enter"))
+
     def _select_all_projects(self) -> None:
         """Use every configured project for an explicit empty selection or startup."""
         self.selected_names = [project.name for project in self.settings.projects]
@@ -249,8 +273,14 @@ class AccessorConsole:
             self._select_all_projects()
             return
         try:
-            indexes = {int(value.strip()) for value in raw.split(",")}
-            selected = [self.settings.projects[index - 1].name for index in indexes]
+            indexes = [int(value.strip()) for value in raw.split(",")]
+            selected: list[str] = []
+            for index in indexes:
+                if not 1 <= index <= len(self.settings.projects):
+                    raise IndexError(index)
+                name = self.settings.projects[index - 1].name
+                if name not in selected:
+                    selected.append(name)
         except (ValueError, IndexError):
             print(t("console.invalid_project_input"))
             self._read_line(t("console.press_enter"))
@@ -352,11 +382,13 @@ class AccessorConsole:
             request_log_path=ROLE_REFRESH_LOG if background_role_output else None,
         )
         unavailable_required = []
+        role_results: dict[str, bool] = {}
         required_roles = {
             project.depends_on_role for project in projects if project.depends_on_role
         }
         for role in self.settings.roles:
             ready = role_refresher.refresh(role)
+            role_results[role.name] = ready
             self._update_refresh_status("role", role.name, t("status.valid") if ready else t("status.invalid"))
             if not ready and role.name in required_roles:
                 unavailable_required.append(role.name)
@@ -371,32 +403,66 @@ class AccessorConsole:
                 print(message)
                 self._read_line(t("console.press_enter"))
             return
+        try:
+            proxy_project, proxy_config, proxy_group = self._selected_proxy(projects)
+        except Exception as error:
+            self._show_proxy_resolution_error(error)
+            return
         if self.active:
-            for project in projects:
-                self._update_refresh_status("project", project.name, t("status.refreshing"))
-                ready = run_project_refresh(self.settings, project)
-                self._update_refresh_status("project", project.name, t("status.valid") if ready else t("status.refresh_failed"))
+            scheduler = self.scheduler
+            if scheduler is None:
+                return
+            scheduler.update_role_ready(role_results)
+            current_group = scheduler.proxy_group
+            if current_group is None:
+                # Schedulers created before this version did not retain the
+                # resolved group.  Their proxy config still tells us which
+                # service was used to create the current managed tunnel.
+                try:
+                    current_group = SshuttleProcess.resolve_proxy_group(scheduler.proxy_config)
+                except Exception:
+                    current_group = None
+            if current_group == proxy_group:
+                scheduler.replace_projects(projects)
+                self._update_refresh_status(
+                    "proxy", "demand",
+                    t("proxy.reused", group=proxy_group), t("action.check"),
+                )
+                return
+            if (
+                self.settings.prepare_network_before_proxy
+                and not prepare_network_before_proxy(password_provider=password_provider)
+            ):
+                detail = network_prepare_error() or t("console.network_error_unknown")
+                if self._ui_active:
+                    self._ui_message = t("console.network_prepare_failed", detail=detail)
+                else:
+                    self._read_line(f"{t('console.network_prepare_failed', detail=detail)}，{t('console.press_enter')}")
+                return
+            self._update_refresh_status(
+                "proxy", "demand", t("proxy.switching", group=proxy_group), t("action.restart"),
+            )
+            scheduler.switch_proxy(
+                projects, proxy_project, proxy_config, proxy_group,
+                network_prepared=self.settings.prepare_network_before_proxy,
+            )
             return
 
-        # The Demand Proxy is a shared connection. The configured service target
-        # is only used for its AWS mapping, not as a project owner.
-        connector = self.settings.projects_by_name.get(self.settings.default_proxy or "")
-        if connector is None:
-            if self._ui_active:
-                self._ui_message = t("console.proxy_missing")
-            else:
-                print(t("console.proxy_missing"))
-                self._read_line(t("console.press_enter"))
-            return
-        # A PF anchor alone may be stale after sshuttle has hung or crashed.
-        # Only a process is considered an externally managed, reusable proxy.
-        external_proxy = self._proxy_is_usable(self._probe_proxy_status())
+        # An externally started sshuttle has no recorded group.  Reusing it
+        # could silently send the selected project's Redis traffic through a
+        # wrong Proxy, so replace it before Accessor takes ownership.
+        external_pids = self._external_proxy_pids()
+        external_proxy = bool(external_pids)
         network_prepared = False
-        if not external_proxy and connector.name not in {project.name for project in projects}:
-            projects.append(connector)
+        if external_proxy:
+            remaining = SshuttleProcess().stop_external_proxy(external_pids)
+            if remaining:
+                self._show_proxy_resolution_error(
+                    RuntimeError(f"external proxy did not exit: {', '.join(map(str, remaining))}")
+                )
+                return
         if (
-            not external_proxy
-            and self.settings.prepare_network_before_proxy
+            self.settings.prepare_network_before_proxy
             and not prepare_network_before_proxy(password_provider=password_provider)
         ):
             if self._ui_active:
@@ -406,7 +472,7 @@ class AccessorConsole:
                 detail = network_prepare_error() or t("console.network_error_unknown")
                 self._read_line(f"{t('console.network_prepare_failed', detail=detail)}，{t('console.press_enter')}")
             return
-        network_prepared = not external_proxy and self.settings.prepare_network_before_proxy
+        network_prepared = self.settings.prepare_network_before_proxy
         # This is the only background job. It automatically renews both AWS
         # roles when their checks fail, then verifies them again. Granted output
         # is written to /tmp/accessor-role-refresh.log by the scheduler, so it
@@ -416,9 +482,11 @@ class AccessorConsole:
         self.scheduler = RefreshScheduler(
             self.settings,
             projects,
-            connector,
+            proxy_project,
+            proxy_config=proxy_config,
+            proxy_group=proxy_group,
             status_reporter=self._update_refresh_status,
-            manage_proxy=not external_proxy,
+            manage_proxy=True,
             network_prepared=network_prepared,
             # Only prompt_toolkit can receive a password safely from this
             # background scheduler thread. Its field remains in this window.
@@ -755,10 +823,14 @@ class AccessorConsole:
         if mode in {"projects", "check_projects"}:
             if command:
                 try:
-                    selected = {
-                        self.settings.projects[int(item.strip()) - 1].name
-                        for item in command.split(",")
-                    }
+                    selected: list[str] = []
+                    for item in command.split(","):
+                        index = int(item.strip())
+                        if not 1 <= index <= len(self.settings.projects):
+                            raise IndexError(index)
+                        name = self.settings.projects[index - 1].name
+                        if name not in selected:
+                            selected.append(name)
                 except (ValueError, IndexError):
                     with self._status_lock:
                         self._ui_message = t("console.invalid_project_number")
@@ -766,9 +838,7 @@ class AccessorConsole:
                     self._invalidate_ui()
                     return
                 if selected:
-                    self.selected_names = [
-                        project.name for project in self.settings.projects if project.name in selected
-                    ]
+                    self.selected_names = selected
             else:
                 # Empty means "all" for both check and enable/refresh. This
                 # makes an explicit project number an opt-in narrowing action.

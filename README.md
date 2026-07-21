@@ -55,7 +55,8 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
   changing credentials or starting a proxy. If a problem is found, Accessor
   offers to start or refresh it.
 - `2` — Run Start / refresh again. Enter project numbers such as `1,3`; an
-  empty value selects every configured project.
+  empty value selects every configured project. When several projects are
+  entered, the first one chooses the Demand Proxy group.
 - `3` — Stop the automatic refresh job and the Accessor-managed Demand Proxy.
   Existing AWS credentials are left on disk.
 - `q` — Exit the console. This also stops the active refresh job.
@@ -71,9 +72,11 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
    CodeArtifact token in `~/.gradle/gradle.properties`. It also renews Docker
    login for the configured ECR registries when Docker is available; an
    optional Docker-login failure does not invalidate the AWS role.
-3. **Demand Proxy** — Accessor resolves the shared proxy host from the SSM
-   mapping in `accessor.toml`, then starts one `sshuttle` tunnel for all selected
-   services. Before a new tunnel it asks for the terminal `sudo` password and
+3. **Demand Proxy** — Accessor resolves the first selected project's proxy
+   group from the SSM mapping in `accessor.toml`, then starts one `sshuttle`
+   tunnel. If the next selection belongs to the same group, the tunnel is
+   reused; otherwise Accessor stops its current tunnel and starts the required
+   group. Before a group change it asks for the terminal `sudo` password and
    runs the required DNS/PF preparation commands. The password is not echoed.
 4. **Project credentials** — Each selected service credential profile is
    refreshed independently. Their normal cadence is 45 minutes; a failed

@@ -159,7 +159,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 results.append(run_project_refresh(settings, project))
         return 0 if all(role_ready.values()) and all(results) else 1
-    return RefreshScheduler(settings, projects, proxy_project).run()
+    proxy_config = (
+        dataclasses.replace(settings.proxy, service_name=proxy_project.service_name)
+        if proxy_project is not None
+        else None
+    )
+    return RefreshScheduler(settings, projects, proxy_project, proxy_config=proxy_config).run()
 
 
 if __name__ == "__main__":

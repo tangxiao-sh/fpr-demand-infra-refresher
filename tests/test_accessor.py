@@ -72,12 +72,14 @@ class SettingsTest(unittest.TestCase):
         self.assertFalse(panel.active)
 
     @mock.patch("console.prepare_network_before_proxy", return_value=True)
+    @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-a")
     @mock.patch("console.RefreshScheduler")
     @mock.patch("console.RoleRefresher")
     def test_console_allows_proxy_when_only_build_role_is_unavailable(
         self,
         refresher_class: mock.Mock,
         scheduler_class: mock.Mock,
+        _resolve_proxy_group: mock.Mock,
         _network_prepare: mock.Mock,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -89,6 +91,81 @@ class SettingsTest(unittest.TestCase):
                 panel.enable_or_refresh()
 
         scheduler_class.assert_called_once()
+
+    @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
+    def test_selected_proxy_uses_the_first_selected_project(
+        self, resolve_proxy_group: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            first, proxy, group = panel._selected_proxy(
+                [settings.projects_by_name["cinv"], settings.projects_by_name["papi"]]
+            )
+
+        self.assertEqual(first.name, "cinv")
+        self.assertEqual(proxy.service_name, "cinv")
+        self.assertEqual(group, "proxy-b")
+        resolve_proxy_group.assert_called_once_with(proxy)
+
+    def test_project_selection_preserves_entered_order_for_proxy_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            with mock.patch("builtins.input", return_value="2,1"):
+                panel._choose_projects()
+
+        self.assertEqual(panel.selected_names, ["cinv", "papi"])
+
+    @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-a")
+    @mock.patch("console.RoleRefresher")
+    def test_active_same_group_reuses_proxy_and_updates_projects(
+        self, refresher_class: mock.Mock, _resolve_proxy_group: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            panel.selected_names = ["papi", "cinv"]
+            worker = mock.Mock(proxy_group="proxy-a")
+            panel.scheduler = worker
+            panel.scheduler_thread = mock.Mock()
+            panel.scheduler_thread.is_alive.return_value = True
+            refresher_class.return_value.refresh.return_value = True
+
+            panel.enable_or_refresh(choose_projects=False)
+
+        worker.replace_projects.assert_called_once_with(
+            [settings.projects_by_name["papi"], settings.projects_by_name["cinv"]]
+        )
+        worker.switch_proxy.assert_not_called()
+
+    @mock.patch("console.prepare_network_before_proxy", return_value=True)
+    @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
+    @mock.patch("console.RoleRefresher")
+    def test_active_different_group_stops_then_switches_proxy(
+        self,
+        refresher_class: mock.Mock,
+        _resolve_proxy_group: mock.Mock,
+        network_prepare: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            panel.selected_names = ["cinv", "papi"]
+            worker = mock.Mock(proxy_group="proxy-a")
+            panel.scheduler = worker
+            panel.scheduler_thread = mock.Mock()
+            panel.scheduler_thread.is_alive.return_value = True
+            refresher_class.return_value.refresh.return_value = True
+
+            panel.enable_or_refresh(choose_projects=False, password_provider=mock.Mock())
+
+        network_prepare.assert_called_once()
+        worker.switch_proxy.assert_called_once()
+        switch_args = worker.switch_proxy.call_args.args
+        self.assertEqual(switch_args[1].name, "cinv")
+        self.assertEqual(switch_args[2].service_name, "cinv")
+        self.assertEqual(switch_args[3], "proxy-b")
 
     def test_refresh_job_reports_results_to_console_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

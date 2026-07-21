@@ -242,8 +242,13 @@ class SshuttleProcess:
         )
 
     @staticmethod
-    def _find_proxy_instance(proxy: ProxyConfig) -> str:
-        """Resolve the shared proxy EC2 instance from Parameter Store."""
+    def resolve_proxy_group(proxy: ProxyConfig) -> str:
+        """Return the Demand Proxy group that serves ``proxy.service_name``.
+
+        The Parameter Store mapping is the source of truth.  Resolving the
+        group independently lets the console reuse an existing sshuttle when
+        two selected services belong to the same group.
+        """
         session = boto3.Session(profile_name=proxy.profile, region_name=proxy.region)
         ssm = session.client("ssm")
         value = ssm.get_parameter(Name=proxy.parameter_mapping)["Parameter"]["Value"]
@@ -251,6 +256,13 @@ class SshuttleProcess:
         instance_name = SshuttleProcess._mapped_instance_name(mapping, proxy.service_name)
         if not instance_name:
             raise RuntimeError(f"service {proxy.service_name} is absent from proxy mapping")
+        return instance_name
+
+    @staticmethod
+    def _find_proxy_instance(proxy: ProxyConfig) -> str:
+        """Resolve and start the EC2 instance for the selected proxy group."""
+        instance_name = SshuttleProcess.resolve_proxy_group(proxy)
+        session = boto3.Session(profile_name=proxy.profile, region_name=proxy.region)
 
         autoscaling = session.client("autoscaling")
         groups = autoscaling.describe_auto_scaling_groups(

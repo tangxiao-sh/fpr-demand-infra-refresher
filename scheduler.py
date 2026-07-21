@@ -13,7 +13,7 @@ import time
 import traceback
 from typing import Any, Callable, Sequence
 
-from config import ProjectConfig, RoleConfig, Settings
+from config import ProjectConfig, ProxyConfig, RoleConfig, Settings
 from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, run_project_refresh
 from sshuttle import SshuttleProcess, proxy_start_error
@@ -68,6 +68,8 @@ class RefreshScheduler:
         settings: Settings,
         projects: Sequence[ProjectConfig],
         proxy_project: ProjectConfig | None,
+        proxy_config: ProxyConfig | None = None,
+        proxy_group: str | None = None,
         status_reporter: StatusReporter | None = None,
         manage_proxy: bool = True,
         network_prepared: bool = False,
@@ -77,6 +79,11 @@ class RefreshScheduler:
         self.settings = settings
         self.projects = tuple(projects)
         self.proxy_project = proxy_project
+        # ``proxy_config`` has the first selected project's service name.  It
+        # deliberately differs from settings.proxy when that project belongs
+        # to a non-default Demand Proxy group.
+        self.proxy_config = proxy_config or settings.proxy
+        self.proxy_group = proxy_group
         self.manage_proxy = manage_proxy
         self.network_prepared = network_prepared
         # The prompt_toolkit console implements this callback by switching the
@@ -137,6 +144,48 @@ class RefreshScheduler:
     def request_stop(self) -> None:
         """Allow the interactive console to stop the background scheduler."""
         self.stop_requested = True
+
+    def replace_projects(self, projects: Sequence[ProjectConfig]) -> None:
+        """Make a new menu selection eligible for an immediate refresh.
+
+        The scheduler remains alive, so a same-group selection does not tear
+        down and recreate the shared sshuttle route.
+        """
+        with self._schedule_lock:
+            self.projects = tuple(projects)
+            self.next_credential_refresh = {
+                project.name: 0.0 for project in self.projects
+            }
+
+    def update_role_ready(self, states: dict[str, bool]) -> None:
+        """Reuse role results already obtained by a foreground menu action."""
+        with self._schedule_lock:
+            self.role_ready.update(states)
+
+    def switch_proxy(
+        self,
+        projects: Sequence[ProjectConfig],
+        proxy_project: ProjectConfig,
+        proxy_config: ProxyConfig,
+        proxy_group: str,
+        network_prepared: bool,
+    ) -> None:
+        """Replace the one managed tunnel after the console chose a new group."""
+        with self._schedule_lock:
+            previous_project = self.proxy_project
+            if self.manage_proxy and previous_project is not None:
+                self.sshuttle.stop(previous_project)
+            self.projects = tuple(projects)
+            self.next_credential_refresh = {
+                project.name: 0.0 for project in self.projects
+            }
+            self.proxy_project = proxy_project
+            self.proxy_config = proxy_config
+            self.proxy_group = proxy_group
+            self.manage_proxy = True
+            self.network_prepared = network_prepared
+            self.next_sshuttle_check = 0.0
+            self._proxy_failure_notified = False
 
     def _project_role_ready(self, project: ProjectConfig) -> bool:
         dependency = project.depends_on_role
@@ -315,7 +364,7 @@ class RefreshScheduler:
         # The tunnel only uses the configured jump-role AWS profile; selected
         # service profiles are refreshed by the separate project worker below.
         started = self.sshuttle.start(
-            self.settings.proxy,
+            self.proxy_config,
             prepare_network=(
                 self.settings.prepare_network_before_proxy and not self.network_prepared
             ),
