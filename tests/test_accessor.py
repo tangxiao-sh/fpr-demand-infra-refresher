@@ -117,6 +117,24 @@ class SettingsTest(unittest.TestCase):
 
         self.assertEqual(panel.selected_names, ["cinv", "papi"])
 
+    @mock.patch("console.threading.Thread")
+    def test_enable_start_recovers_from_an_exited_action_thread(
+        self, thread_class: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            previous = mock.Mock()
+            previous.is_alive.return_value = False
+            panel._enable_in_progress = True
+            panel._enable_action_thread = previous
+
+            panel._start_enable_from_prompt()
+
+        thread_class.return_value.start.assert_called_once()
+        self.assertTrue(panel._enable_in_progress)
+        self.assertIs(panel._enable_action_thread, thread_class.return_value)
+
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-a")
     @mock.patch("console.RoleRefresher")
     def test_active_same_group_reuses_proxy_and_updates_projects(
@@ -553,6 +571,26 @@ class CredentialAndArtifactTest(unittest.TestCase):
 
 
 class SshuttleProcessTest(unittest.TestCase):
+    @mock.patch("sshuttle.boto3.Session")
+    def test_proxy_group_resolution_has_short_client_timeouts(
+        self, session_class: mock.Mock
+    ) -> None:
+        ssm = mock.Mock()
+        ssm.get_parameter.return_value = {
+            "Parameter": {"Value": '{"proxy-a": {"fprpapi": "sg-123"}}'}
+        }
+        session_class.return_value.client.return_value = ssm
+
+        self.assertEqual(
+            sshuttle.SshuttleProcess.resolve_proxy_group(config.ProxyConfig()), "proxy-a"
+        )
+
+        self.assertEqual(session_class.return_value.client.call_args.args, ("ssm",))
+        self.assertIs(
+            session_class.return_value.client.call_args.kwargs["config"],
+            sshuttle.PROXY_MAPPING_CLIENT_CONFIG,
+        )
+
     @mock.patch("sshuttle.subprocess.run")
     @mock.patch("sshuttle.shutil.which", return_value="/usr/bin/curl")
     def test_health_check_bypasses_http_proxy(self, _which: mock.Mock, run: mock.Mock) -> None:

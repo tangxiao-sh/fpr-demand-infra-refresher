@@ -13,6 +13,7 @@ import json
 import time
 
 import boto3
+from botocore.config import Config
 
 from config import ProjectConfig, ProxyConfig
 from i18n import t
@@ -30,6 +31,14 @@ NETWORK_PREP_COMMANDS = (
 LAST_NETWORK_PREP_ERROR: str | None = None
 LAST_PROXY_START_ERROR: str | None = None
 SUDO_AUTH_ATTEMPTS = 5  # First entry plus four retries.
+# Group selection happens before a menu action can finish.  The default boto3
+# timeouts and retries can otherwise leave the UI in its "starting" state for
+# several minutes when AWS is temporarily unreachable.
+PROXY_MAPPING_CLIENT_CONFIG = Config(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
 
 
 def network_prepare_error() -> str | None:
@@ -250,7 +259,7 @@ class SshuttleProcess:
         two selected services belong to the same group.
         """
         session = boto3.Session(profile_name=proxy.profile, region_name=proxy.region)
-        ssm = session.client("ssm")
+        ssm = session.client("ssm", config=PROXY_MAPPING_CLIENT_CONFIG)
         value = ssm.get_parameter(Name=proxy.parameter_mapping)["Parameter"]["Value"]
         mapping = json.loads(value)
         instance_name = SshuttleProcess._mapped_instance_name(mapping, proxy.service_name)

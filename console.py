@@ -51,6 +51,7 @@ class AccessorConsole:
         self._app: object | None = None
         self._password_waiter: tuple[threading.Event, list[str]] | None = None
         self._enable_in_progress = False
+        self._enable_action_thread: threading.Thread | None = None
         self.activity: deque[str] = deque(maxlen=8)
         self.role_status = {role.name: t("status.unchecked") for role in settings.roles}
         self.project_status = {project.name: t("status.unchecked") for project in settings.projects}
@@ -747,6 +748,8 @@ class AccessorConsole:
             finally:
                 with self._status_lock:
                     self._enable_in_progress = False
+                    if self._enable_action_thread is threading.current_thread():
+                        self._enable_action_thread = None
                 if not was_active and self.active:
                     self._accessor_log_level = previous_level
                 elif not self.active:
@@ -761,15 +764,29 @@ class AccessorConsole:
 
         with self._status_lock:
             if self._enable_in_progress:
-                self._ui_message = t("console.enable_running")
-                self._status_version += 1
-                self._invalidate_ui()
-                return
+                # A worker should always clear this flag in ``finally``.  If
+                # it did not (for example after an interpreter-level error),
+                # do not leave the menu permanently disabled once its thread
+                # has exited.
+                if (
+                    self._enable_action_thread is not None
+                    and self._enable_action_thread.is_alive()
+                ):
+                    self._ui_message = t("console.enable_running")
+                    self._status_version += 1
+                    self._invalidate_ui()
+                    return
+                self._enable_in_progress = False
             self._enable_in_progress = True
             self._ui_mode = "running"
             self._ui_message = t("console.enabling")
             self._status_version += 1
-        threading.Thread(target=enable, name="accessor-action", daemon=True).start()
+        action_thread = threading.Thread(
+            target=enable, name="accessor-action", daemon=True
+        )
+        with self._status_lock:
+            self._enable_action_thread = action_thread
+        action_thread.start()
         self._invalidate_ui()
 
     def _handle_prompt_command(self, text: str, input_area: object) -> None:
