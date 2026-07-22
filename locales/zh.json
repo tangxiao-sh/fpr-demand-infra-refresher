@@ -52,6 +52,7 @@
   "console.required_roles_unavailable": "以下必要角色尚不可用：{roles}",
   "console.proxy_missing": "未配置 Demand Proxy connector。",
   "console.proxy_resolution_failed": "无法解析所选项目的 Demand Proxy：{error}",
+  "console.proxy_resolution_timeout": "Demand Proxy 分组解析超时，请稍后重试",
   "console.network_prepare_failed": "网络准备失败：{detail}",
   "console.network_error_unknown": "未返回具体错误",
   "console.job_not_started": "未开启刷新：{message}",

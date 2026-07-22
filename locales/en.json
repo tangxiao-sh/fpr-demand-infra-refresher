@@ -52,6 +52,7 @@
   "console.required_roles_unavailable": "Required roles are unavailable: {roles}",
   "console.proxy_missing": "Demand Proxy connector is not configured.",
   "console.proxy_resolution_failed": "Unable to resolve the selected project's Demand Proxy: {error}",
+  "console.proxy_resolution_timeout": "Demand Proxy group resolution timed out; please try again",
   "console.network_prepare_failed": "Network preparation failed: {detail}",
   "console.network_error_unknown": "No further detail was returned",
   "console.job_not_started": "Refresh job was not started: {message}",

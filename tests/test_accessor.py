@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 import signal
 import subprocess
@@ -72,6 +73,7 @@ class SettingsTest(unittest.TestCase):
         self.assertFalse(panel.active)
 
     @mock.patch("console.prepare_network_before_proxy", return_value=True)
+    @mock.patch.object(console.AccessorConsole, "_resolve_proxy_group", return_value="proxy-a")
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-a")
     @mock.patch("console.RefreshScheduler")
     @mock.patch("console.RoleRefresher")
@@ -80,6 +82,7 @@ class SettingsTest(unittest.TestCase):
         refresher_class: mock.Mock,
         scheduler_class: mock.Mock,
         _resolve_proxy_group: mock.Mock,
+        _resolve_proxy_group_async: mock.Mock,
         _network_prepare: mock.Mock,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -91,6 +94,11 @@ class SettingsTest(unittest.TestCase):
                 panel.enable_or_refresh()
 
         scheduler_class.assert_called_once()
+        scheduler_class.return_value.wait_for_proxy_attempt.assert_called_once()
+        self.assertEqual(
+            scheduler_class.call_args.kwargs["initial_role_ready"],
+            {"build": False, "jump": True},
+        )
 
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
     def test_selected_proxy_uses_the_first_selected_project(
@@ -135,6 +143,18 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(panel._enable_in_progress)
         self.assertIs(panel._enable_action_thread, thread_class.return_value)
 
+    def test_finished_enable_operation_always_restores_the_menu(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            with mock.patch.object(panel, "enable_or_refresh"):
+                panel._start_enable_from_prompt()
+                if panel._enable_action_thread is not None:
+                    panel._enable_action_thread.join(timeout=2)
+
+        self.assertFalse(panel._enable_in_progress)
+        self.assertEqual(panel._ui_mode, "status")
+
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-a")
     @mock.patch("console.RoleRefresher")
     def test_active_same_group_reuses_proxy_and_updates_projects(
@@ -145,6 +165,9 @@ class SettingsTest(unittest.TestCase):
             panel = console.AccessorConsole(settings)
             panel.selected_names = ["papi", "cinv"]
             worker = mock.Mock(proxy_group="proxy-a")
+            worker.proxy_config = dataclasses.replace(
+                settings.proxy, service_name="papi"
+            )
             panel.scheduler = worker
             panel.scheduler_thread = mock.Mock()
             panel.scheduler_thread.is_alive.return_value = True
@@ -156,6 +179,7 @@ class SettingsTest(unittest.TestCase):
             [settings.projects_by_name["papi"], settings.projects_by_name["cinv"]]
         )
         worker.switch_proxy.assert_not_called()
+        _resolve_proxy_group.assert_not_called()
 
     @mock.patch("console.prepare_network_before_proxy", return_value=True)
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
@@ -765,6 +789,49 @@ class SshuttleProcessTest(unittest.TestCase):
 
 
 class SchedulerThreadTest(unittest.TestCase):
+    def test_scheduler_reuses_foreground_role_results_on_initial_start(self) -> None:
+        role = config.RoleConfig("jump", "JumpRole@example", 600, 60, True)
+        settings = config.Settings(
+            config_path=Path(tempfile.gettempdir()) / "accessor-role-reuse.lock",
+            auto_request=False, request_command=(), command_timeout_seconds=30,
+            post_request_delay_seconds=1, prepare_network_before_proxy=False,
+            sshuttle_check_seconds=300, lock_file=Path(tempfile.gettempdir()) / "accessor-role-reuse.lock",
+            default_projects=(), default_proxy=None, roles=(role,), projects=(),
+        )
+        worker = scheduler.RefreshScheduler(
+            settings, (), None, initial_role_ready={"jump": True}
+        )
+        worker._refresh_role = mock.Mock()
+        worker._initial_refreshes = mock.Mock(side_effect=lambda _now: worker.request_stop())
+
+        self.assertEqual(worker.run(), 0)
+
+        worker._refresh_role.assert_not_called()
+        self.assertTrue(worker.role_ready["jump"])
+
+    def test_initial_proxy_attempt_always_releases_foreground_waiter(self) -> None:
+        """A failed first start must unlock the console operation."""
+        project = config.ProjectConfig(
+            name="fprpapi", description="", service_name="fprpapi",
+            depends_on_role=None, credential_refresh_seconds=2700,
+            credential_retry_seconds=60, restart_delay_seconds=10, shutdown_grace_seconds=15,
+        )
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=False, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=("fprpapi",),
+            default_proxy="fprpapi", roles=(), projects=(project,),
+        )
+        worker = scheduler.RefreshScheduler(settings, (project,), project)
+        worker.sshuttle.is_alive = mock.Mock(return_value=False)
+        worker.sshuttle.start = mock.Mock(return_value=False)
+
+        worker._check_sshuttle(100.0)
+
+        self.assertTrue(worker._proxy_attempt_done.is_set())
+        worker.sshuttle.start.assert_called_once()
+
     def test_proxy_failure_notifies_once_until_a_health_probe_recovers(self) -> None:
         project = config.ProjectConfig(
             name="fprpapi", description="", service_name="fprpapi",

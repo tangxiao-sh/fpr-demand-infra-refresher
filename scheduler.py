@@ -75,6 +75,7 @@ class RefreshScheduler:
         network_prepared: bool = False,
         sudo_password_provider: Callable[[], str] | None = None,
         proxy_failure_notifier: ProxyFailureNotifier | None = None,
+        initial_role_ready: dict[str, bool] | None = None,
     ):
         self.settings = settings
         self.projects = tuple(projects)
@@ -92,6 +93,12 @@ class RefreshScheduler:
         self.sudo_password_provider = sudo_password_provider
         self.proxy_failure_notifier = proxy_failure_notifier
         self._proxy_failure_notified = False
+        # The console waits for this one-shot event during an explicit open or
+        # Proxy-group switch.  The scheduler never manipulates UI state: it
+        # only says when the first Proxy decision has completed.
+        self._proxy_attempt_done = threading.Event()
+        self._proxy_attempt_pending = proxy_project is not None
+        self._initial_role_ready = dict(initial_role_ready) if initial_role_ready else None
         # Keep automatic Granted output out of the console. The request still
         # runs with the exact configured role and is verified afterwards; its
         # diagnostics remain available in this local log.
@@ -144,6 +151,7 @@ class RefreshScheduler:
     def request_stop(self) -> None:
         """Allow the interactive console to stop the background scheduler."""
         self.stop_requested = True
+        self._complete_pending_proxy_attempt()
 
     def replace_projects(self, projects: Sequence[ProjectConfig]) -> None:
         """Make a new menu selection eligible for an immediate refresh.
@@ -161,6 +169,23 @@ class RefreshScheduler:
         """Reuse role results already obtained by a foreground menu action."""
         with self._schedule_lock:
             self.role_ready.update(states)
+
+    def wait_for_proxy_attempt(self) -> None:
+        """Wait until the initial/switch Proxy attempt has a reported result.
+
+        There is deliberately no UI timeout here.  ``sshuttle.start`` owns
+        AWS/SSH completion and reports its result; releasing the menu before
+        that result would allow a second conflicting Proxy operation.
+        """
+        self._proxy_attempt_done.wait()
+
+    def _complete_pending_proxy_attempt(self) -> None:
+        """Release the foreground opener after exactly one Proxy outcome."""
+        with self._schedule_lock:
+            if not self._proxy_attempt_pending:
+                return
+            self._proxy_attempt_pending = False
+            self._proxy_attempt_done.set()
 
     def switch_proxy(
         self,
@@ -184,6 +209,8 @@ class RefreshScheduler:
             self.proxy_group = proxy_group
             self.manage_proxy = True
             self.network_prepared = network_prepared
+            self._proxy_attempt_pending = True
+            self._proxy_attempt_done.clear()
             self.next_sshuttle_check = 0.0
             self._proxy_failure_notified = False
 
@@ -317,6 +344,7 @@ class RefreshScheduler:
                             t("action.restart"),
                         )
                         self.next_sshuttle_check = now + project.restart_delay_seconds
+                        self._complete_pending_proxy_attempt()
                         return
                 # It is now safe to replace the failed external connection.
                 self.manage_proxy = True
@@ -329,6 +357,7 @@ class RefreshScheduler:
                     status = t("scheduler.external_no_health")
                 self._report_status("proxy", "demand", status, t("action.check"))
                 self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
+                self._complete_pending_proxy_attempt()
                 return
         if self.sshuttle.is_alive():
             healthy, total = self.sshuttle.check_health(self.settings.proxy_health_urls)
@@ -351,6 +380,7 @@ class RefreshScheduler:
                     "proxy", "demand", t("proxy.managed", health=health), t("action.check")
                 )
                 self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
+                self._complete_pending_proxy_attempt()
                 return
         if not self._project_role_ready(project):
             LOG.warning("sshuttle for %s waits for role %s", project.name, project.depends_on_role)
@@ -358,11 +388,15 @@ class RefreshScheduler:
                 "proxy", "demand", t("scheduler.wait_role", role=project.depends_on_role), t("action.wait")
             )
             self.next_sshuttle_check = now + project.restart_delay_seconds
+            self._complete_pending_proxy_attempt()
             return
         LOG.info("sshuttle for %s is not running; starting it", project.name)
         # Proxy startup is intentionally independent from service credentials.
         # The tunnel only uses the configured jump-role AWS profile; selected
         # service profiles are refreshed by the separate project worker below.
+        # Publish before AWS/EC2 discovery so the status screen reflects the
+        # real operation while sshuttle is still being prepared.
+        self._report_status("proxy", "demand", t("scheduler.starting"), t("action.start"))
         started = self.sshuttle.start(
             self.proxy_config,
             prepare_network=(
@@ -377,12 +411,11 @@ class RefreshScheduler:
         # process restart. Do not kill a tunnel that is still connecting; wait
         # at least one minute before its first health check.
         self.next_sshuttle_check = now + max(60, project.restart_delay_seconds)
-        if started:
-            proxy_status = t("scheduler.starting")
-        else:
+        if not started:
             reason = proxy_start_error()
             proxy_status = t("scheduler.start_failed", reason=reason) if reason else t("scheduler.start_failed_generic")
-        self._report_status("proxy", "demand", proxy_status, t("action.start") if started else t("action.restart"))
+            self._report_status("proxy", "demand", proxy_status, t("action.restart"))
+        self._complete_pending_proxy_attempt()
 
     def _initial_refreshes(self, now: float) -> None:
         """Queue credentials immediately; Proxy startup must not delay them."""
@@ -427,8 +460,17 @@ class RefreshScheduler:
         try:
             with SingleInstance(self.settings.lock_file):
                 now = time.monotonic()
-                for role in self.settings.roles:
-                    self._refresh_role(role, now)
+                if self._initial_role_ready is None:
+                    for role in self.settings.roles:
+                        self._refresh_role(role, now)
+                else:
+                    with self._schedule_lock:
+                        self.role_ready.update(self._initial_role_ready)
+                        for role in self.settings.roles:
+                            ready = self.role_ready[role.name]
+                            self.next_role_refresh[role.name] = now + (
+                                role.refresh_seconds if ready else role.retry_seconds
+                            )
                 self._initial_refreshes(now)
                 while not self.stop_requested:
                     now = time.monotonic()
@@ -451,6 +493,9 @@ class RefreshScheduler:
             self._record_fatal_error(error)
             return 1
         finally:
+            # A lock conflict, cancellation, or unexpected scheduler error
+            # must not leave the foreground opener waiting forever.
+            self._complete_pending_proxy_attempt()
             if self.proxy_project is not None and self.manage_proxy:
                 self.sshuttle.stop(self.proxy_project)
             for signum, handler in previous_handlers.items():

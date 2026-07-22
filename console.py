@@ -23,6 +23,7 @@ from sshuttle import SshuttleProcess, network_prepare_error, prepare_network_bef
 
 LOG = logging.getLogger("accessor.console")
 ACTIVITY_LOG = Path("/tmp/accessor-activity.log")
+PROXY_GROUP_RESOLUTION_TIMEOUT_SECONDS = 20
 TERMINAL_APPLICATIONS = {
     "Apple_Terminal": "Terminal",
     "iTerm.app": "iTerm",
@@ -227,10 +228,10 @@ class AccessorConsole:
         known = self.settings.projects_by_name
         return [known[name] for name in self.selected_names if name in known]
 
-    def _selected_proxy(
+    def _selected_proxy_config(
         self, projects: list[ProjectConfig]
-    ) -> tuple[ProjectConfig, ProxyConfig, str]:
-        """Resolve the first selected project's Demand Proxy group.
+    ) -> tuple[ProjectConfig, ProxyConfig]:
+        """Build the first selected project's Demand Proxy configuration.
 
         sshuttle owns system-wide PF and DNS rules, so only one tunnel can be
         active.  For a multi-project selection, preserving the displayed
@@ -240,7 +241,36 @@ class AccessorConsole:
         proxy = dataclasses.replace(
             self.settings.proxy, service_name=project.service_name
         )
-        return project, proxy, SshuttleProcess.resolve_proxy_group(proxy)
+        return project, proxy
+
+    def _resolve_proxy_group(self, proxy: ProxyConfig) -> str:
+        """Resolve one group without allowing a stalled boto call to lock the UI."""
+        completed, result = threading.Event(), []
+
+        def resolve() -> None:
+            try:
+                result.append(SshuttleProcess.resolve_proxy_group(proxy))
+            except Exception as error:
+                result.append(error)
+            finally:
+                completed.set()
+
+        threading.Thread(
+            target=resolve, name="accessor-proxy-resolution", daemon=True
+        ).start()
+        if not completed.wait(PROXY_GROUP_RESOLUTION_TIMEOUT_SECONDS):
+            raise TimeoutError(t("console.proxy_resolution_timeout"))
+        value = result[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def _selected_proxy(
+        self, projects: list[ProjectConfig]
+    ) -> tuple[ProjectConfig, ProxyConfig, str]:
+        """Resolve the first selected project's Proxy group when it is needed."""
+        project, proxy = self._selected_proxy_config(projects)
+        return project, proxy, self._resolve_proxy_group(proxy)
 
     def _show_proxy_resolution_error(self, error: Exception) -> None:
         """Show a mapping failure without stopping the currently working tunnel."""
@@ -404,25 +434,30 @@ class AccessorConsole:
                 print(message)
                 self._read_line(t("console.press_enter"))
             return
-        try:
-            proxy_project, proxy_config, proxy_group = self._selected_proxy(projects)
-        except Exception as error:
-            self._show_proxy_resolution_error(error)
-            return
         if self.active:
             scheduler = self.scheduler
             if scheduler is None:
                 return
+            proxy_project, proxy_config = self._selected_proxy_config(projects)
             scheduler.update_role_ready(role_results)
             current_group = scheduler.proxy_group
-            if current_group is None:
-                # Schedulers created before this version did not retain the
-                # resolved group.  Their proxy config still tells us which
-                # service was used to create the current managed tunnel.
+            # Re-selecting the service that owns the currently managed tunnel
+            # cannot change its group.  Avoid a second simultaneous boto3
+            # credential/SSM resolution while sshuttle is reconnecting.
+            if (
+                current_group is not None
+                and scheduler.proxy_config.service_name == proxy_config.service_name
+            ):
+                proxy_group = current_group
+            else:
+                # A different service can map to a different Proxy group.
+                # Old Scheduler instances may also lack a cached group; in
+                # that case a safe replacement is preferable to guessing.
                 try:
-                    current_group = SshuttleProcess.resolve_proxy_group(scheduler.proxy_config)
-                except Exception:
-                    current_group = None
+                    proxy_group = self._resolve_proxy_group(proxy_config)
+                except Exception as error:
+                    self._show_proxy_resolution_error(error)
+                    return
             if current_group == proxy_group:
                 scheduler.replace_projects(projects)
                 self._update_refresh_status(
@@ -447,6 +482,16 @@ class AccessorConsole:
                 projects, proxy_project, proxy_config, proxy_group,
                 network_prepared=self.settings.prepare_network_before_proxy,
             )
+            # The foreground operation owns the UI lock.  Do not accept a
+            # second selection until this replacement has reported a Proxy
+            # result (started, reused, waiting for role, or failed).
+            scheduler.wait_for_proxy_attempt()
+            return
+
+        try:
+            proxy_project, proxy_config, proxy_group = self._selected_proxy(projects)
+        except Exception as error:
+            self._show_proxy_resolution_error(error)
             return
 
         # An externally started sshuttle has no recorded group.  Reusing it
@@ -493,6 +538,7 @@ class AccessorConsole:
             # background scheduler thread. Its field remains in this window.
             sudo_password_provider=self._prompt_password if self._app is not None else None,
             proxy_failure_notifier=self._notify_proxy_failure,
+            initial_role_ready=role_results,
         )
         accessor_logger = logging.getLogger("accessor")
         self._accessor_log_level = accessor_logger.level
@@ -501,6 +547,10 @@ class AccessorConsole:
             target=self._run_scheduler_with_retry, name="accessor-refresh", daemon=True
         )
         self.scheduler_thread.start()
+        # This wait is intentional: the same foreground operation that locks
+        # the menu owns its release.  Project credential refresh is already
+        # running in the scheduler's separate worker while we wait here.
+        self.scheduler.wait_for_proxy_attempt()
 
     def _run_scheduler_with_retry(self) -> None:
         """Keep the one refresh worker alive if a transient task crashes."""
@@ -744,6 +794,11 @@ class AccessorConsole:
                     choose_projects=False,
                     password_provider=self._prompt_password,
                     background_role_output=True,
+                )
+            except Exception as error:
+                LOG.exception("Enable/refresh operation failed")
+                self._update_refresh_status(
+                    "job", "refresh", f"{type(error).__name__}: {error}", t("action.failure")
                 )
             finally:
                 with self._status_lock:
