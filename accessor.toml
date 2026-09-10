@@ -151,10 +151,10 @@ credential_refresh_seconds = 2700
 
 [[projects]]
 name = "fprsapi"
-description = "fprsapi service credentials (uses fprpapi service role)"
-service_name = "fprpapi"
-discovery_tag = "cluster"
-discovery_value = "fprpapi-app"
+description = "fprsapi service credentials"
+service_name = "fprsapi"
+discovery_tag = "service"
+discovery_value = "fprsapi"
 session_name_mode = "caller"
 session_name_prefix = "local_staging"
 credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"

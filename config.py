@@ -224,7 +224,7 @@ def _read_projects(
         description = entry.get("description", "")
         if not isinstance(description, str):
             raise ConfigError(f"{field}.description must be a string")
-        service_name = entry.get("service_name", "fprpapi" if name == "fprsapi" else name)
+        service_name = entry.get("service_name", name)
         if not isinstance(service_name, str) or not service_name:
             raise ConfigError(f"{field}.service_name must be a non-empty string")
         credential_profile = entry.get("credential_profile", "LocalStagingJumpRole@tvlk-fpr-dev")
