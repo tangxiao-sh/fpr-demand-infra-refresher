@@ -16,12 +16,18 @@ Accessor 目前支持 macOS，并要求电脑已安装 Homebrew。克隆仓库�
 脚本会在缺失时安装 `aws`、Granted 提供的 `assume`、`sshuttle` 和 `curl`，然后创建或
 更新项目内的 `.venv` 并安装 Python 依赖。可以重复执行。
 
-它不会修改 `~/.aws`、不会执行 `aws configure`、不会替你登录 Granted，也不会启动
-Proxy。请先配置好自己的 AWS 和 Granted，并确认以下命令可用：
+它不会启动 Proxy，也不会直接 assume 角色。请先配置好自己的 AWS 和 Granted，并确认以下
+命令可用：
 
 ```bash
 assume --help
 ```
+
+启动过程中，如果配置里的 AWS profile 本地不存在，Accessor 可以执行和业务项目
+`setup_dev_blaze.sh` 相同的 Granted SSO profile 同步步骤：
+`granted sso populate --profile-template "{{ .RoleName }}@{{ .AccountName }}"`
+并使用 `https://tvlk.awsapps.com/start/`。这只会创建你当前 SSO 账号本来可见的 profile，
+不会授予新的权限。
 
 ## 2. 启动 Accessor
 
@@ -54,21 +60,22 @@ assume --help
 
 ### “开启 / 刷新”会做什么
 
-1. **AWS 角色**：先检查配置的角色。若角色不可用，会以精确 profile 执行配置中的 Granted
+1. **AWS 角色**：先检查配置的角色。如果 profile 本地不存在，会先执行配置的 SSO profile
+   同步步骤；若已有 profile 不可用，会以精确 profile 执行配置中的 Granted
    命令（`assume --wait --export PROFILE`），随后验证该 AWS profile。构建角色、Gradle 使用的
    `beiartf` 旧 profile，以及本地 staging jump role 分别独立维护。
 2. **构建制品**：每次 build role 成功刷新后，都会更新
    `~/.gradle/gradle.properties` 中的 Gradle CodeArtifact token。若 Docker 可用，也会更新配置的
    ECR registry 登录；Docker 登录失败不会将有效 AWS 角色标记为失效。
-3. **Demand Proxy**：从 `accessor.toml` 配置的 SSM mapping 中按第一个所选项目解析 proxy
-   分组，并建立一个 `sshuttle` 隧道。下一次选择仍属于同一分组时会复用现有隧道；属于不同分组时，
-   Accessor 会停止当前隧道并启动对应分组。切换或新建前会在当前终端请求 `sudo` 密码，并执行
-   DNS/PF 网络准备命令；密码不会回显。
+3. **Demand Proxy**：Accessor 按 `[proxy]` 配置启动一个共享 dev/blaze `sshuttle` 隧道。
+   所选项目不再决定 proxy 分组，只决定要刷新哪些服务凭证。启动隧道前会在当前终端请求
+   `sudo` 密码，并执行 DNS/PF 网络准备命令；密码不会回显。旧 staging SSM mapping proxy
+   配置已在 `accessor.toml` 中注释保留，仅用于回滚或参考。
 4. **项目凭证**：每个所选服务的凭证独立刷新。正常刷新间隔为 45 分钟；失败后按配置的重试
    间隔执行。刷新凭证不会重启健康的 Proxy。
-5. **持续检查**：角色每 10 分钟检查一次；Proxy 每 5 分钟通过配置的私有健康检查地址验证。
-   如果由 Accessor 管理的隧道全部健康检查失败，会自动重启；外部启动但已失效的隧道会先被接管
-   再替换。
+5. **持续检查**：角色每 10 分钟检查一次。当前 dev/blaze 配置下，Proxy 只检查 Accessor
+   自己启动的 `sshuttle` 进程是否存活；旧 staging 健康检查 URL 已禁用。如果该隧道退出，
+   Accessor 会自动重启。
 
 控制台只展示缓存状态与最近活动，后台刷新期间依然可操作；界面重绘本身不会触发 AWS 或网络
 调用。
@@ -99,8 +106,8 @@ assume --help
 ./accessor run --all-projects --no-proxy
 ```
 
-`run` 会保持所选凭证刷新，并可选地启动共享 Proxy。`--proxy` 仅指定用于解析共享 proxy 的
-connector，不代表该项目拥有 Proxy。`--no-proxy` 则只刷新凭证。
+`run` 会保持所选凭证刷新，并可选地启动共享 Proxy。当前 dev/blaze proxy 对所有项目共享，
+所以 `--proxy` 不会改变隧道目标。`--no-proxy` 则只刷新凭证。
 
 ### 单次操作与校验
 

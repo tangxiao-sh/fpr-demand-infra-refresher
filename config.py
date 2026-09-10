@@ -53,7 +53,7 @@ class ProjectConfig:
     restart_delay_seconds: int
     shutdown_grace_seconds: int
     service_name: str = ""
-    credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-stg"
+    credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-dev"
     ecs_cluster_name: str = ""
     ec2_cluster_tag: str | None = None
     discovery_tag: str = "service"
@@ -66,9 +66,12 @@ class ProjectConfig:
 class ProxyConfig:
     """Shared Demand Proxy settings extracted from the reference behavior."""
 
-    profile: str = "LocalStagingJumpRole@tvlk-fpr-stg"
+    mode: str = "blaze"
+    profile: str = "LocalStagingJumpRole@tvlk-fpr-dev"
     service_name: str = "fprpapi"
     parameter_mapping: str = "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
+    environment: str = "development"
+    group: str = "demand"
     region: str = "ap-southeast-1"
     exclude_cidr: str = "172.17.0.0/16"
     subnets: tuple[str, ...] = (
@@ -97,6 +100,16 @@ class BuildArtifactsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SsoPopulateConfig:
+    """Granted SSO profile discovery used when a configured profile is absent."""
+
+    enabled: bool = False
+    start_url: str = "https://tvlk.awsapps.com/start/"
+    sso_region: str = "ap-southeast-1"
+    profile_template: str = "{{ .RoleName }}@{{ .AccountName }}"
+
+
+@dataclasses.dataclass(frozen=True)
 class Settings:
     """Global configuration plus every project selectable by the CLI."""
 
@@ -114,6 +127,7 @@ class Settings:
     projects: tuple[ProjectConfig, ...]
     proxy: ProxyConfig = ProxyConfig()
     build_artifacts: BuildArtifactsConfig = BuildArtifactsConfig()
+    sso_populate: SsoPopulateConfig = SsoPopulateConfig()
     # Private endpoints that prove sshuttle forwarding works end to end.
     proxy_health_urls: tuple[str, ...] = ()
     # A service credential operation is isolated in a worker. Its shorter
@@ -213,9 +227,7 @@ def _read_projects(
         service_name = entry.get("service_name", "fprpapi" if name == "fprsapi" else name)
         if not isinstance(service_name, str) or not service_name:
             raise ConfigError(f"{field}.service_name must be a non-empty string")
-        credential_profile = entry.get(
-            "credential_profile", "LocalStagingJumpRole@tvlk-fpr-stg"
-        )
+        credential_profile = entry.get("credential_profile", "LocalStagingJumpRole@tvlk-fpr-dev")
         if not isinstance(credential_profile, str) or not credential_profile:
             raise ConfigError(f"{field}.credential_profile must be a non-empty string")
         ecs_cluster_name = entry.get("ecs_cluster_name", "")
@@ -325,6 +337,26 @@ def _read_build_artifacts(document: dict[str, Any]) -> BuildArtifactsConfig:
     )
 
 
+def _read_sso_populate(document: dict[str, Any]) -> SsoPopulateConfig:
+    """Read optional Granted SSO profile-population settings."""
+    entry = document.get("sso_populate", {})
+    if not isinstance(entry, dict):
+        raise ConfigError("[sso_populate] must be a table")
+    enabled = entry.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("sso_populate.enabled must be true or false")
+    defaults = SsoPopulateConfig()
+    values = {
+        "start_url": entry.get("start_url", defaults.start_url),
+        "sso_region": entry.get("sso_region", defaults.sso_region),
+        "profile_template": entry.get("profile_template", defaults.profile_template),
+    }
+    for field, value in values.items():
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"sso_populate.{field} must be a non-empty string")
+    return SsoPopulateConfig(enabled=enabled, **values)
+
+
 def load_settings(config_path: Path) -> Settings:
     """Load TOML and validate only static values; this does not access AWS."""
     path = config_path.expanduser().resolve()
@@ -342,6 +374,7 @@ def load_settings(config_path: Path) -> Settings:
     roles = _read_roles(document)
     projects = _read_projects(document, {role.name for role in roles})
     build_artifacts = _read_build_artifacts(document)
+    sso_populate = _read_sso_populate(document)
     if build_artifacts.enabled and build_artifacts.role_name not in {role.name for role in roles}:
         raise ConfigError("build_artifacts.role_name must refer to a configured role")
     project_names = {project.name for project in projects}
@@ -384,11 +417,14 @@ def load_settings(config_path: Path) -> Settings:
     if not isinstance(proxy_document, dict):
         raise ConfigError("[proxy] must be a table")
     proxy = ProxyConfig(
-        profile=proxy_document.get("profile", "LocalStagingJumpRole@tvlk-fpr-stg"),
+        mode=proxy_document.get("mode", "blaze"),
+        profile=proxy_document.get("profile", "LocalStagingJumpRole@tvlk-fpr-dev"),
         service_name=proxy_document.get("service_name", "fprpapi"),
         parameter_mapping=proxy_document.get(
             "parameter_mapping", "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
         ),
+        environment=proxy_document.get("environment", "development"),
+        group=proxy_document.get("group", "demand"),
         region=proxy_document.get("region", "ap-southeast-1"),
         exclude_cidr=proxy_document.get("exclude_cidr", "172.17.0.0/16"),
         subnets=_string_list(
@@ -396,7 +432,9 @@ def load_settings(config_path: Path) -> Settings:
         ),
         ssh_user=proxy_document.get("ssh_user", "ubuntu"),
     )
-    for field_name in ("profile", "service_name", "parameter_mapping", "region", "exclude_cidr", "ssh_user"):
+    if proxy.mode not in {"blaze", "ssm_mapping"}:
+        raise ConfigError("proxy.mode must be either 'blaze' or 'ssm_mapping'")
+    for field_name in ("profile", "service_name", "parameter_mapping", "environment", "group", "region", "exclude_cidr", "ssh_user"):
         if not isinstance(getattr(proxy, field_name), str) or not getattr(proxy, field_name):
             raise ConfigError(f"proxy.{field_name} must be a non-empty string")
 
@@ -427,6 +465,7 @@ def load_settings(config_path: Path) -> Settings:
         projects=projects,
         proxy=proxy,
         build_artifacts=build_artifacts,
+        sso_populate=sso_populate,
         proxy_health_urls=_string_list(
             general.get("proxy_health_urls"), "general.proxy_health_urls"
         ),

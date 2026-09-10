@@ -133,6 +133,13 @@ def _discover_role(session: Any, project: ProjectConfig) -> str:
     raise CredentialError(f"no Java EC2, ECS task, or Lambda role found for {project.service_name}")
 
 
+def _blaze_role_arn(session: Any, settings: Settings) -> str:
+    """Return the Crossplane/dev role used by establish_proxy_connection_dev_blaze.py."""
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    role_name = f"{settings.proxy.environment}-{settings.proxy.group}-instance-blz"
+    return f"arn:aws:iam::{account_id}:role/{role_name}"
+
+
 def _session_name(session: Any, project: ProjectConfig) -> str:
     if project.session_name_mode == "caller":
         user_id = session.client("sts").get_caller_identity().get("UserId", "accessor")
@@ -172,7 +179,11 @@ def refresh_service_credentials(settings: Settings, project: ProjectConfig) -> s
         profile_name=project.credential_profile,
         region_name=settings.proxy.region,
     )
-    role_arn = _discover_role(session, project)
+    role_arn = (
+        _blaze_role_arn(session, settings)
+        if settings.proxy.mode == "blaze"
+        else _discover_role(session, project)
+    )
     credentials = session.client("sts").assume_role(
         RoleArn=role_arn,
         RoleSessionName=_session_name(session, project),

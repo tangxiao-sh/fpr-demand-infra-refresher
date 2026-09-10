@@ -14,6 +14,7 @@ import time
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import WaiterError
 
 from config import ProjectConfig, ProxyConfig
 from i18n import t
@@ -29,6 +30,7 @@ NETWORK_PREP_COMMANDS = (
     ("pfctl", "-f", "/etc/pf.conf"),
 )
 LAST_NETWORK_PREP_ERROR: str | None = None
+LAST_NETWORK_PREP_NEEDS_PASSWORD = False
 LAST_PROXY_START_ERROR: str | None = None
 SUDO_AUTH_ATTEMPTS = 5  # First entry plus four retries.
 # Group selection happens before a menu action can finish.  The default boto3
@@ -39,11 +41,32 @@ PROXY_MAPPING_CLIENT_CONFIG = Config(
     read_timeout=10,
     retries={"max_attempts": 2, "mode": "standard"},
 )
+# boto3's EC2 waiters default to 40 attempts with a 15-second delay.  A
+# missing/unhealthy Demand Proxy would therefore freeze an interactive open
+# action for about ten minutes before reporting an error.  Proxy recovery must
+# fail promptly and let the scheduler retry on its normal cadence instead.
+INSTANCE_RUNNING_WAITER_CONFIG = {"Delay": 5, "MaxAttempts": 18}
+INSTANCE_STATUS_WAITER_CONFIG = {"Delay": 5, "MaxAttempts": 12}
+REGION_CODES = {
+    "ap-southeast-1": "apse1",
+    "ap-southeast-2": "apse2",
+    "ap-southeast-3": "apse3",
+    "ap-northeast-1": "apne1",
+    "ap-south-1": "aps1",
+    "us-east-1": "use1",
+    "us-west-2": "usw2",
+    "eu-west-1": "euw1",
+}
 
 
 def network_prepare_error() -> str | None:
     """Return the last human-readable sudo/network preparation failure."""
     return LAST_NETWORK_PREP_ERROR
+
+
+def network_prepare_needs_password() -> bool:
+    """Return whether the last network prep failed only because sudo needs input."""
+    return LAST_NETWORK_PREP_NEEDS_PASSWORD
 
 
 def proxy_start_error() -> str | None:
@@ -60,8 +83,9 @@ def prepare_network_before_proxy(
     recovery uses ``allow_prompt=False``: every sudo command is noninteractive,
     so an expired sudo cache is reported instead of stealing terminal input.
     """
-    global LAST_NETWORK_PREP_ERROR
+    global LAST_NETWORK_PREP_ERROR, LAST_NETWORK_PREP_NEEDS_PASSWORD
     LAST_NETWORK_PREP_ERROR = None
+    LAST_NETWORK_PREP_NEEDS_PASSWORD = False
     LOG.info("Network preparation requires sudo")
     # A user may have configured SUDO_ASKPASS globally. Remove it so a missing
     # terminal fails safely instead of falling back to a graphical password UI.
@@ -111,6 +135,7 @@ def prepare_network_before_proxy(
                 LAST_NETWORK_PREP_ERROR = t("sshuttle.sudo_failed", detail=f": {detail}" if detail else "")
             else:
                 LAST_NETWORK_PREP_ERROR = t("sshuttle.sudo_expired")
+                LAST_NETWORK_PREP_NEEDS_PASSWORD = True
             LOG.error("%s; proxy will not start", LAST_NETWORK_PREP_ERROR)
             return False
         for command in NETWORK_PREP_COMMANDS:
@@ -123,7 +148,11 @@ def prepare_network_before_proxy(
                 else {}
             )
             result = subprocess.run(
-                ["sudo", "-n", *command], env=terminal_env, check=False, **hidden_output
+                ["sudo", "-n", *command],
+                stdin=subprocess.DEVNULL,
+                env=terminal_env,
+                check=False,
+                **hidden_output,
             )
             if result.returncode != 0:
                 detail = (getattr(result, "stderr", "") or "").strip()
@@ -254,10 +283,17 @@ class SshuttleProcess:
     def resolve_proxy_group(proxy: ProxyConfig) -> str:
         """Return the Demand Proxy group that serves ``proxy.service_name``.
 
-        The Parameter Store mapping is the source of truth.  Resolving the
-        group independently lets the console reuse an existing sshuttle when
-        two selected services belong to the same group.
+        The new dev/blaze proxy is shared by every selected service, so it is
+        resolved deterministically and does not depend on project selection.
+        The old SSM mapping path is kept only for explicit compatibility.
         """
+        if proxy.mode == "blaze":
+            if proxy.region == "ap-southeast-1":
+                return f"{proxy.environment}-{proxy.group}-proxy-01"
+            if proxy.region not in REGION_CODES:
+                raise ValueError(f"unsupported Blaze proxy region: {proxy.region}")
+            return f"{proxy.environment}-{proxy.group}-proxy-{REGION_CODES[proxy.region]}-01"
+
         session = boto3.Session(profile_name=proxy.profile, region_name=proxy.region)
         ssm = session.client("ssm", config=PROXY_MAPPING_CLIENT_CONFIG)
         value = ssm.get_parameter(Name=proxy.parameter_mapping)["Parameter"]["Value"]
@@ -290,7 +326,15 @@ class SshuttleProcess:
             {"Name": "tag:Name", "Values": [instance_name]},
             {"Name": "instance-state-name", "Values": ["running"]},
         ]
-        ec2.get_waiter("instance_running").wait(Filters=running_filter)
+        try:
+            ec2.get_waiter("instance_running").wait(
+                Filters=running_filter,
+                WaiterConfig=INSTANCE_RUNNING_WAITER_CONFIG,
+            )
+        except WaiterError as error:
+            raise RuntimeError(
+                f"proxy instance {instance_name} did not enter running state within 90 seconds"
+            ) from error
         response = ec2.describe_instances(Filters=running_filter)
         instances = [
             instance
@@ -300,7 +344,15 @@ class SshuttleProcess:
         if not instances:
             raise RuntimeError(f"proxy instance {instance_name} did not become available")
         instance_id = instances[0]["InstanceId"]
-        ec2.get_waiter("instance_status_ok").wait(InstanceIds=[instance_id])
+        try:
+            ec2.get_waiter("instance_status_ok").wait(
+                InstanceIds=[instance_id],
+                WaiterConfig=INSTANCE_STATUS_WAITER_CONFIG,
+            )
+        except WaiterError as error:
+            raise RuntimeError(
+                f"proxy instance {instance_name} did not pass EC2 status checks within 60 seconds"
+            ) from error
         return instance_id
 
     @staticmethod
@@ -530,15 +582,35 @@ class SshuttleProcess:
         for process_id in process_ids:
             try:
                 os.kill(process_id, signum)
-            except (ProcessLookupError, PermissionError):
-                pass
+                continue
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                subprocess.run(
+                    ["sudo", "-n", "kill", f"-{signum.value}", str(process_id)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
 
     def stop_external_proxy(self, process_ids: Sequence[int]) -> tuple[int, ...]:
         """Request shutdown of an unhealthy external proxy before replacing it."""
         process_ids = tuple(sorted({pid for pid in process_ids if pid > 0}))
         LOG.warning("Stopping unhealthy external sshuttle processes: %s", process_ids)
+        # Stopped firewall helpers ignore TERM until continued. This can happen
+        # when an older sshuttle process tried to read a terminal it no longer owns.
+        self._signal(process_ids, signal.SIGCONT)
         self._signal(process_ids, signal.SIGTERM)
-        time.sleep(0.2)
+        time.sleep(1.0)
+        remaining = self._remaining_pids(process_ids)
+        if remaining:
+            self._signal(remaining, signal.SIGKILL)
+            time.sleep(0.2)
+        return self._remaining_pids(process_ids)
+
+    @staticmethod
+    def _remaining_pids(process_ids: Sequence[int]) -> tuple[int, ...]:
         remaining: list[int] = []
         for process_id in process_ids:
             try:

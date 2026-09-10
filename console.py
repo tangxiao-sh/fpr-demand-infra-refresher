@@ -17,7 +17,7 @@ from pathlib import Path
 from config import ProjectConfig, ProxyConfig, Settings
 from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, check_project_credentials, run_project_refresh
-from scheduler import LOCK_CONFLICT_EXIT_CODE, RefreshScheduler
+from scheduler import LOCK_CONFLICT_EXIT_CODE, NEED_SUDO_PASSWORD_EXIT_CODE, RefreshScheduler
 from sshuttle import SshuttleProcess, network_prepare_error, prepare_network_before_proxy
 
 
@@ -53,6 +53,7 @@ class AccessorConsole:
         self._password_waiter: tuple[threading.Event, list[str]] | None = None
         self._enable_in_progress = False
         self._enable_action_thread: threading.Thread | None = None
+        self._sudo_resume_in_progress = False
         self.activity: deque[str] = deque(maxlen=8)
         self.role_status = {role.name: t("status.unchecked") for role in settings.roles}
         self.project_status = {project.name: t("status.unchecked") for project in settings.projects}
@@ -231,17 +232,13 @@ class AccessorConsole:
     def _selected_proxy_config(
         self, projects: list[ProjectConfig]
     ) -> tuple[ProjectConfig, ProxyConfig]:
-        """Build the first selected project's Demand Proxy configuration.
+        """Return the shared Demand Proxy configuration.
 
-        sshuttle owns system-wide PF and DNS rules, so only one tunnel can be
-        active.  For a multi-project selection, preserving the displayed
-        project order gives the user a deterministic tunnel choice.
+        The dev/blaze proxy is one shared tunnel for every project. Project
+        selection only decides which service credentials are refreshed.
         """
         project = projects[0]
-        proxy = dataclasses.replace(
-            self.settings.proxy, service_name=project.service_name
-        )
-        return project, proxy
+        return project, self.settings.proxy
 
     def _resolve_proxy_group(self, proxy: ProxyConfig) -> str:
         """Resolve one group without allowing a stalled boto call to lock the UI."""
@@ -438,54 +435,11 @@ class AccessorConsole:
             scheduler = self.scheduler
             if scheduler is None:
                 return
-            proxy_project, proxy_config = self._selected_proxy_config(projects)
             scheduler.update_role_ready(role_results)
-            current_group = scheduler.proxy_group
-            # Re-selecting the service that owns the currently managed tunnel
-            # cannot change its group.  Avoid a second simultaneous boto3
-            # credential/SSM resolution while sshuttle is reconnecting.
-            if (
-                current_group is not None
-                and scheduler.proxy_config.service_name == proxy_config.service_name
-            ):
-                proxy_group = current_group
-            else:
-                # A different service can map to a different Proxy group.
-                # Old Scheduler instances may also lack a cached group; in
-                # that case a safe replacement is preferable to guessing.
-                try:
-                    proxy_group = self._resolve_proxy_group(proxy_config)
-                except Exception as error:
-                    self._show_proxy_resolution_error(error)
-                    return
-            if current_group == proxy_group:
-                scheduler.replace_projects(projects)
-                self._update_refresh_status(
-                    "proxy", "demand",
-                    t("proxy.reused", group=proxy_group), t("action.check"),
-                )
-                return
-            if (
-                self.settings.prepare_network_before_proxy
-                and not prepare_network_before_proxy(password_provider=password_provider)
-            ):
-                detail = network_prepare_error() or t("console.network_error_unknown")
-                if self._ui_active:
-                    self._ui_message = t("console.network_prepare_failed", detail=detail)
-                else:
-                    self._read_line(f"{t('console.network_prepare_failed', detail=detail)}，{t('console.press_enter')}")
-                return
+            scheduler.replace_projects(projects)
             self._update_refresh_status(
-                "proxy", "demand", t("proxy.switching", group=proxy_group), t("action.restart"),
+                "proxy", "demand", t("proxy.reused", group=scheduler.proxy_group or self.settings.proxy.group), t("action.check"),
             )
-            scheduler.switch_proxy(
-                projects, proxy_project, proxy_config, proxy_group,
-                network_prepared=self.settings.prepare_network_before_proxy,
-            )
-            # The foreground operation owns the UI lock.  Do not accept a
-            # second selection until this replacement has reported a Proxy
-            # result (started, reused, waiting for role, or failed).
-            scheduler.wait_for_proxy_attempt()
             return
 
         try:
@@ -494,30 +448,17 @@ class AccessorConsole:
             self._show_proxy_resolution_error(error)
             return
 
-        # An externally started sshuttle has no recorded group.  Reusing it
-        # could silently send the selected project's Redis traffic through a
-        # wrong Proxy, so replace it before Accessor takes ownership.
-        external_pids = self._external_proxy_pids()
-        external_proxy = bool(external_pids)
         network_prepared = False
-        if external_proxy:
-            remaining = SshuttleProcess().stop_external_proxy(external_pids)
-            if remaining:
-                self._show_proxy_resolution_error(
-                    RuntimeError(f"external proxy did not exit: {', '.join(map(str, remaining))}")
-                )
+        if self.settings.prepare_network_before_proxy:
+            network_prepared = prepare_network_before_proxy(password_provider=password_provider)
+            if not network_prepared:
+                if self._ui_active:
+                    detail = network_prepare_error() or t("console.network_error_unknown")
+                    self._ui_message = t("console.network_prepare_failed", detail=detail)
+                else:
+                    detail = network_prepare_error() or t("console.network_error_unknown")
+                    self._read_line(f"{t('console.network_prepare_failed', detail=detail)}，{t('console.press_enter')}")
                 return
-        if (
-            self.settings.prepare_network_before_proxy
-            and not prepare_network_before_proxy(password_provider=password_provider)
-        ):
-            if self._ui_active:
-                detail = network_prepare_error() or t("console.network_error_unknown")
-                self._ui_message = t("console.network_prepare_failed", detail=detail)
-            else:
-                detail = network_prepare_error() or t("console.network_error_unknown")
-                self._read_line(f"{t('console.network_prepare_failed', detail=detail)}，{t('console.press_enter')}")
-            return
         network_prepared = self.settings.prepare_network_before_proxy
         # This is the only background job. It automatically renews both AWS
         # roles when their checks fail, then verifies them again. Granted output
@@ -534,9 +475,6 @@ class AccessorConsole:
             status_reporter=self._update_refresh_status,
             manage_proxy=True,
             network_prepared=network_prepared,
-            # Only prompt_toolkit can receive a password safely from this
-            # background scheduler thread. Its field remains in this window.
-            sudo_password_provider=self._prompt_password if self._app is not None else None,
             proxy_failure_notifier=self._notify_proxy_failure,
             initial_role_ready=role_results,
         )
@@ -547,10 +485,6 @@ class AccessorConsole:
             target=self._run_scheduler_with_retry, name="accessor-refresh", daemon=True
         )
         self.scheduler_thread.start()
-        # This wait is intentional: the same foreground operation that locks
-        # the menu owns its release.  Project credential refresh is already
-        # running in the scheduler's separate worker while we wait here.
-        self.scheduler.wait_for_proxy_attempt()
 
     def _run_scheduler_with_retry(self) -> None:
         """Keep the one refresh worker alive if a transient task crashes."""
@@ -568,10 +502,62 @@ class AccessorConsole:
                     logging.getLogger("accessor").setLevel(self._accessor_log_level)
                     self._accessor_log_level = None
                 return
+            if result == NEED_SUDO_PASSWORD_EXIT_CODE:
+                self._start_sudo_resume_from_prompt()
+                return
             self._update_refresh_status(
                 "job", "refresh", t("console.job_retry", code=result), t("action.restart")
             )
             time.sleep(60)
+
+    def _start_sudo_resume_from_prompt(self) -> None:
+        """Collect sudo input through the UI, then restart the refresh worker."""
+        if self._app is None:
+            self._update_refresh_status(
+                "job", "refresh", t("console.job_waiting_sudo"), t("action.wait")
+            )
+            return
+        with self._status_lock:
+            if self._sudo_resume_in_progress:
+                return
+            self._sudo_resume_in_progress = True
+        self._update_refresh_status(
+            "job", "refresh", t("console.job_waiting_sudo"), t("action.wait")
+        )
+
+        def resume() -> None:
+            try:
+                if not prepare_network_before_proxy(password_provider=self._prompt_password):
+                    detail = network_prepare_error() or t("console.network_error_unknown")
+                    self._update_refresh_status(
+                        "job",
+                        "refresh",
+                        t("console.network_prepare_failed", detail=detail),
+                        t("action.failure"),
+                    )
+                    return
+                scheduler = self.scheduler
+                if scheduler is None or scheduler.stop_requested:
+                    return
+                scheduler.network_prepared = True
+                self._update_refresh_status(
+                    "job", "refresh", t("console.job_sudo_ready"), t("action.start")
+                )
+                self.scheduler_thread = threading.Thread(
+                    target=self._run_scheduler_with_retry,
+                    name="accessor-refresh",
+                    daemon=True,
+                )
+                self.scheduler_thread.start()
+            finally:
+                with self._status_lock:
+                    self._sudo_resume_in_progress = False
+                    if self._ui_mode == "running":
+                        self._ui_mode = "status"
+                    self._status_version += 1
+                self._invalidate_ui()
+
+        threading.Thread(target=resume, name="accessor-sudo-resume", daemon=True).start()
 
     def close(self, show_message: bool = True) -> None:
         """Stop all background refreshes and the shared proxy, preserving credentials."""
@@ -746,6 +732,11 @@ class AccessorConsole:
 
     def _prompt_password(self) -> str:
         """Block the worker until the prompt_toolkit UI supplies a hidden password."""
+        if not self._has_foreground_tty():
+            self._update_refresh_status(
+                "job", "refresh", t("console.not_foreground"), t("action.failure")
+            )
+            return ""
         self._activate_terminal_window()
         ready, value = threading.Event(), []
         with self._status_lock:
@@ -812,7 +803,10 @@ class AccessorConsole:
                 with self._status_lock:
                     if self._ui_mode != "password":
                         self._ui_mode = "status"
-                        if self._ui_message == t("console.enabling"):
+                        if self._ui_message in {
+                            t("console.enabling"),
+                            t("console.enable_running"),
+                        }:
                             self._ui_message = t("console.enable_complete")
                     self._status_version += 1
                 self._invalidate_ui()
@@ -954,6 +948,9 @@ class AccessorConsole:
         from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.widgets import TextArea
 
+        if not self._has_foreground_tty():
+            print(t("console.not_foreground"), file=sys.stderr)
+            return 1
         input_area = TextArea(
             multiline=False,
             password=Condition(lambda: self._ui_mode == "password"),
@@ -1000,6 +997,16 @@ class AccessorConsole:
             elif choice in {"q", "quit", "exit"}:
                 self.close()
                 return 0
+
+    @staticmethod
+    def _has_foreground_tty() -> bool:
+        """Return whether this process owns the terminal input foreground."""
+        if not sys.stdin.isatty():
+            return False
+        try:
+            return os.getpgrp() == os.tcgetpgrp(sys.stdin.fileno())
+        except OSError:
+            return False
 
 
 def run_console(settings: Settings) -> int:

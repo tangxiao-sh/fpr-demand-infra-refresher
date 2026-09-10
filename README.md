@@ -20,13 +20,19 @@ The script installs missing command dependencies (`aws`, Granted's `assume`,
 `sshuttle`, and `curl`), then creates or updates the project-local `.venv` and
 installs its Python dependencies. It is safe to rerun.
 
-It deliberately does **not** edit `~/.aws`, run `aws configure`, sign you into
-Granted, or start a proxy. Before using Accessor, configure your own AWS and
-Granted access and confirm that this works:
+It deliberately does **not** start a proxy or assume roles. Before using
+Accessor, configure your own AWS and Granted access and confirm that this
+works:
 
 ```bash
 assume --help
 ```
+
+During startup, if a configured AWS profile is missing locally, Accessor can
+run the same Granted SSO profile-population step used by project setup scripts:
+`granted sso populate --profile-template "{{ .RoleName }}@{{ .AccountName }}"`
+against `https://tvlk.awsapps.com/start/`. This only creates profiles that your
+SSO account can actually see; it does not grant new permissions.
 
 ## 2. Start Accessor
 
@@ -64,7 +70,8 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
 ### What “Start / refresh” does
 
 1. **AWS roles** — Accessor checks the configured roles first. When a role is
-   unavailable, it invokes the configured Granted command for that exact
+   missing locally, it first runs the configured SSO profile-population step.
+   When an existing role profile is unavailable, it invokes the configured Granted command for that exact
    profile (`assume --wait --export PROFILE`) and verifies the resulting AWS
    profile. The build role, its legacy `beiartf` Gradle profile, and the local
    staging jump role are handled independently.
@@ -72,20 +79,21 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
    CodeArtifact token in `~/.gradle/gradle.properties`. It also renews Docker
    login for the configured ECR registries when Docker is available; an
    optional Docker-login failure does not invalidate the AWS role.
-3. **Demand Proxy** — Accessor resolves the first selected project's proxy
-   group from the SSM mapping in `accessor.toml`, then starts one `sshuttle`
-   tunnel. If the next selection belongs to the same group, the tunnel is
-   reused; otherwise Accessor stops its current tunnel and starts the required
-   group. Before a group change it asks for the terminal `sudo` password and
-   runs the required DNS/PF preparation commands. The password is not echoed.
+3. **Demand Proxy** — Accessor starts one shared dev/blaze `sshuttle` tunnel
+   from the `[proxy]` configuration. The selected projects no longer decide the
+   proxy group; they only decide which service credentials are refreshed.
+   Before starting the tunnel it asks for the terminal `sudo` password and runs
+   the required DNS/PF preparation commands. The password is not echoed. The
+   old staging SSM-mapping proxy settings are kept commented in
+   `accessor.toml` for rollback/reference only.
 4. **Project credentials** — Each selected service credential profile is
    refreshed independently. Their normal cadence is 45 minutes; a failed
    refresh uses the configured retry interval. Updating credentials does not
    restart a healthy Proxy.
-5. **Ongoing health** — Roles are checked every 10 minutes. The Proxy is health
-   checked every five minutes using the configured private endpoints. If an
-   Accessor-managed tunnel has failed every probe, Accessor restarts it; an
-   unhealthy external tunnel is taken over before replacement.
+5. **Ongoing health** — Roles are checked every 10 minutes. With the current
+   dev/blaze configuration, Proxy monitoring only checks whether Accessor's
+   own `sshuttle` process is alive; the old staging health URLs are disabled.
+   If the managed tunnel exits, Accessor restarts it.
 
 The console shows cached status and recent activity while this work runs in the
 background. It does not perform AWS or network calls merely to redraw itself.
@@ -117,9 +125,8 @@ build-role refresh, run `./gradlew --stop` once, then start the build again.
 ```
 
 `run` keeps the selected credentials refreshed and optionally starts the shared
-Proxy. The `--proxy` value only chooses the configured connector used to resolve
-the shared proxy; it does not make that project the proxy owner. `--no-proxy`
-refreshes credentials only.
+Proxy. The current dev/blaze proxy is shared by every project, so `--proxy`
+does not change the tunnel target. `--no-proxy` refreshes credentials only.
 
 ### One-off operations and validation
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 import signal
 import subprocess
@@ -14,6 +13,7 @@ import config
 import build_artifacts
 import cli
 import console
+import credentials
 import i18n
 import permissions
 import sshuttle
@@ -34,6 +34,35 @@ class SettingsTest(unittest.TestCase):
             run.call_args.args[0],
             ["osascript", "-e", 'tell application "Terminal" to activate'],
         )
+
+    @mock.patch("console.os.tcgetpgrp", return_value=1234)
+    @mock.patch("console.os.getpgrp", return_value=1234)
+    @mock.patch("console.sys.stdin.isatty", return_value=True)
+    def test_foreground_tty_check_accepts_the_terminal_foreground_process(
+        self, _isatty: mock.Mock, _getpgrp: mock.Mock, _tcgetpgrp: mock.Mock
+    ) -> None:
+        self.assertTrue(console.AccessorConsole._has_foreground_tty())
+
+    @mock.patch("console.os.tcgetpgrp", return_value=4321)
+    @mock.patch("console.os.getpgrp", return_value=1234)
+    @mock.patch("console.sys.stdin.isatty", return_value=True)
+    def test_foreground_tty_check_rejects_a_background_process_group(
+        self, _isatty: mock.Mock, _getpgrp: mock.Mock, _tcgetpgrp: mock.Mock
+    ) -> None:
+        self.assertFalse(console.AccessorConsole._has_foreground_tty())
+
+    def test_password_prompt_does_not_read_when_accessor_is_not_foreground(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+
+        with (
+            mock.patch.object(panel, "_has_foreground_tty", return_value=False),
+            mock.patch.object(panel, "_activate_terminal_window") as activate,
+        ):
+            self.assertEqual(panel._prompt_password(), "")
+
+        activate.assert_not_called()
 
     def test_cli_defaults_to_interactive_console(self) -> None:
         self.assertEqual(cli.parse_arguments([]).action, "console")
@@ -94,14 +123,14 @@ class SettingsTest(unittest.TestCase):
                 panel.enable_or_refresh()
 
         scheduler_class.assert_called_once()
-        scheduler_class.return_value.wait_for_proxy_attempt.assert_called_once()
+        scheduler_class.return_value.wait_for_proxy_attempt.assert_not_called()
         self.assertEqual(
             scheduler_class.call_args.kwargs["initial_role_ready"],
             {"build": False, "jump": True},
         )
 
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
-    def test_selected_proxy_uses_the_first_selected_project(
+    def test_selected_proxy_uses_shared_configured_proxy(
         self, resolve_proxy_group: mock.Mock
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -112,7 +141,7 @@ class SettingsTest(unittest.TestCase):
             )
 
         self.assertEqual(first.name, "cinv")
-        self.assertEqual(proxy.service_name, "cinv")
+        self.assertEqual(proxy.service_name, settings.proxy.service_name)
         self.assertEqual(group, "proxy-b")
         resolve_proxy_group.assert_called_once_with(proxy)
 
@@ -147,27 +176,40 @@ class SettingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             settings = config.load_settings(self.write_config(Path(temporary)))
             panel = console.AccessorConsole(settings)
-            with mock.patch.object(panel, "enable_or_refresh"):
+            def leave_busy_message(**_kwargs: object) -> None:
+                panel._ui_message = i18n.t("console.enable_running")
+
+            with mock.patch.object(panel, "enable_or_refresh", side_effect=leave_busy_message):
                 panel._start_enable_from_prompt()
                 if panel._enable_action_thread is not None:
                     panel._enable_action_thread.join(timeout=2)
 
         self.assertFalse(panel._enable_in_progress)
         self.assertEqual(panel._ui_mode, "status")
+        self.assertEqual(panel._ui_message, i18n.t("console.enable_complete"))
 
-    @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-a")
+    def test_sudo_password_exit_starts_async_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            panel = console.AccessorConsole(settings)
+            panel.scheduler = mock.Mock(stop_requested=False)
+            panel.scheduler.run.return_value = scheduler.NEED_SUDO_PASSWORD_EXIT_CODE
+
+            with mock.patch.object(panel, "_start_sudo_resume_from_prompt") as resume:
+                panel._run_scheduler_with_retry()
+
+        resume.assert_called_once()
+
     @mock.patch("console.RoleRefresher")
-    def test_active_same_group_reuses_proxy_and_updates_projects(
-        self, refresher_class: mock.Mock, _resolve_proxy_group: mock.Mock
+    def test_active_refresh_only_updates_projects_for_shared_proxy(
+        self, refresher_class: mock.Mock
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = config.load_settings(self.write_config(Path(temporary)))
             panel = console.AccessorConsole(settings)
             panel.selected_names = ["papi", "cinv"]
-            worker = mock.Mock(proxy_group="proxy-a")
-            worker.proxy_config = dataclasses.replace(
-                settings.proxy, service_name="papi"
-            )
+            worker = mock.Mock(proxy_group="development-demand-proxy-01")
+            worker.proxy_config = settings.proxy
             panel.scheduler = worker
             panel.scheduler_thread = mock.Mock()
             panel.scheduler_thread.is_alive.return_value = True
@@ -179,12 +221,11 @@ class SettingsTest(unittest.TestCase):
             [settings.projects_by_name["papi"], settings.projects_by_name["cinv"]]
         )
         worker.switch_proxy.assert_not_called()
-        _resolve_proxy_group.assert_not_called()
 
     @mock.patch("console.prepare_network_before_proxy", return_value=True)
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
     @mock.patch("console.RoleRefresher")
-    def test_active_different_group_stops_then_switches_proxy(
+    def test_active_different_selection_does_not_switch_shared_proxy(
         self,
         refresher_class: mock.Mock,
         _resolve_proxy_group: mock.Mock,
@@ -202,12 +243,10 @@ class SettingsTest(unittest.TestCase):
 
             panel.enable_or_refresh(choose_projects=False, password_provider=mock.Mock())
 
-        network_prepare.assert_called_once()
-        worker.switch_proxy.assert_called_once()
-        switch_args = worker.switch_proxy.call_args.args
-        self.assertEqual(switch_args[1].name, "cinv")
-        self.assertEqual(switch_args[2].service_name, "cinv")
-        self.assertEqual(switch_args[3], "proxy-b")
+        network_prepare.assert_not_called()
+        worker.replace_projects.assert_called_once()
+        worker.switch_proxy.assert_not_called()
+        _resolve_proxy_group.assert_not_called()
 
     def test_refresh_job_reports_results_to_console_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -378,6 +417,7 @@ class SettingsTest(unittest.TestCase):
         settings = config.load_settings(Path(__file__).parents[1] / "accessor.toml")
 
         self.assertTrue(settings.build_artifacts.enabled)
+        self.assertTrue(settings.sso_populate.enabled)
         self.assertIn("fprmfdt", settings.projects_by_name)
 
     def test_allows_shared_default_proxy_connector_without_selecting_its_project(self) -> None:
@@ -569,7 +609,54 @@ class CredentialAndArtifactTest(unittest.TestCase):
             )
 
         self.assertEqual(run.call_args_list[1].kwargs["stderr"], subprocess.STDOUT)
+        self.assertEqual(run.call_args_list[1].kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(run.call_args_list[1].kwargs["start_new_session"])
+        self.assertEqual(
+            tuple(run.call_args_list[1].args[0]),
+            ("/bin/zsh", "-c", "assume --wait --export BuildRole@example"),
+        )
         self.assertIn("stdout", run.call_args_list[1].kwargs)
+
+    @mock.patch("permissions.subprocess.run")
+    def test_missing_profile_populates_sso_before_role_request(self, run: mock.Mock) -> None:
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=True,
+            request_command=("assume", "--wait", "--export"), command_timeout_seconds=30,
+            post_request_delay_seconds=1, prepare_network_before_proxy=True, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=(), default_proxy=None,
+            roles=(), projects=(),
+            sso_populate=config.SsoPopulateConfig(enabled=True),
+        )
+        role = config.RoleConfig("jump", "JumpRole@example", 600, 60, True)
+        run.side_effect = [
+            subprocess.CompletedProcess([], 0),  # granted sso populate
+            subprocess.CompletedProcess([], 1),  # initial STS check
+            subprocess.CompletedProcess([], 0),  # assume
+            subprocess.CompletedProcess([], 0),  # final STS check
+        ]
+        with (
+            mock.patch("permissions.time.sleep"),
+            mock.patch.object(
+                permissions.RoleRefresher,
+                "_profile_exists",
+                side_effect=[False, True],
+            ),
+        ):
+            self.assertTrue(permissions.RoleRefresher(settings).refresh(role))
+
+        self.assertEqual(
+            tuple(run.call_args_list[0].args[0]),
+            (
+                "granted",
+                "sso",
+                "populate",
+                "--profile-template",
+                "{{ .RoleName }}@{{ .AccountName }}",
+                "--sso-region",
+                "ap-southeast-1",
+                "https://tvlk.awsapps.com/start/",
+            ),
+        )
 
     @staticmethod
     def project(proxy: Path) -> config.ProjectConfig:
@@ -593,10 +680,97 @@ class CredentialAndArtifactTest(unittest.TestCase):
         self.assertEqual(permissions.refresh_project_credentials(settings, project), "example-service")
         refresh.assert_called_once_with(settings, project)
 
+    @mock.patch("credentials._write_credentials")
+    @mock.patch("credentials.boto3.Session")
+    def test_blaze_service_refresh_uses_crossplane_role(
+        self, session_class: mock.Mock, _write: mock.Mock
+    ) -> None:
+        sts = mock.Mock()
+        sts.get_caller_identity.return_value = {
+            "Account": "123456789012",
+            "UserId": "AROA:test-user",
+        }
+        sts.assume_role.return_value = {
+            "Credentials": {
+                "AccessKeyId": "key",
+                "SecretAccessKey": "secret",
+                "SessionToken": "token",
+            }
+        }
+        session_class.return_value.client.return_value = sts
+        project = config.ProjectConfig(
+            name="fprsapi", description="", service_name="fprsapi",
+            depends_on_role="local-dev-jump", credential_refresh_seconds=2700,
+            credential_retry_seconds=60, restart_delay_seconds=10, shutdown_grace_seconds=15,
+        )
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=False, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=(), default_proxy=None,
+            roles=(), projects=(project,),
+        )
+
+        self.assertEqual(credentials.refresh_service_credentials(settings, project), "fprsapi")
+
+        sts.assume_role.assert_called_once()
+        self.assertEqual(
+            sts.assume_role.call_args.kwargs["RoleArn"],
+            "arn:aws:iam::123456789012:role/development-demand-instance-blz",
+        )
+
 
 class SshuttleProcessTest(unittest.TestCase):
     @mock.patch("sshuttle.boto3.Session")
-    def test_proxy_group_resolution_has_short_client_timeouts(
+    def test_proxy_instance_waits_have_a_bounded_timeout(
+        self, session_class: mock.Mock
+    ) -> None:
+        """A stopped Demand Proxy must not hold the interactive menu for 10 minutes."""
+        autoscaling = mock.Mock()
+        autoscaling.describe_auto_scaling_groups.return_value = {
+            "AutoScalingGroups": [{"AutoScalingGroupName": "proxy-a", "DesiredCapacity": 1}]
+        }
+        ec2 = mock.Mock()
+        running_waiter = mock.Mock()
+        status_waiter = mock.Mock()
+        ec2.get_waiter.side_effect = [running_waiter, status_waiter]
+        ec2.describe_instances.return_value = {
+            "Reservations": [{"Instances": [{"InstanceId": "i-123"}]}]
+        }
+        session_class.return_value.client.side_effect = [autoscaling, ec2]
+
+        with mock.patch.object(sshuttle.SshuttleProcess, "resolve_proxy_group", return_value="proxy-a"):
+            self.assertEqual(sshuttle.SshuttleProcess._find_proxy_instance(config.ProxyConfig()), "i-123")
+
+        self.assertEqual(
+            running_waiter.wait.call_args.kwargs["WaiterConfig"],
+            sshuttle.INSTANCE_RUNNING_WAITER_CONFIG,
+        )
+        self.assertEqual(
+            status_waiter.wait.call_args.kwargs["WaiterConfig"],
+            sshuttle.INSTANCE_STATUS_WAITER_CONFIG,
+        )
+
+    @mock.patch("sshuttle.boto3.Session")
+    def test_proxy_instance_running_timeout_is_reported_clearly(
+        self, session_class: mock.Mock
+    ) -> None:
+        autoscaling = mock.Mock()
+        autoscaling.describe_auto_scaling_groups.return_value = {
+            "AutoScalingGroups": [{"AutoScalingGroupName": "proxy-a", "DesiredCapacity": 1}]
+        }
+        ec2 = mock.Mock()
+        ec2.get_waiter.return_value.wait.side_effect = sshuttle.WaiterError(
+            name="InstanceRunning", reason="maximum attempts exceeded", last_response={}
+        )
+        session_class.return_value.client.side_effect = [autoscaling, ec2]
+
+        with mock.patch.object(sshuttle.SshuttleProcess, "resolve_proxy_group", return_value="proxy-a"):
+            with self.assertRaisesRegex(RuntimeError, "within 90 seconds"):
+                sshuttle.SshuttleProcess._find_proxy_instance(config.ProxyConfig())
+
+    @mock.patch("sshuttle.boto3.Session")
+    def test_ssm_proxy_group_resolution_has_short_client_timeouts(
         self, session_class: mock.Mock
     ) -> None:
         ssm = mock.Mock()
@@ -606,13 +780,27 @@ class SshuttleProcessTest(unittest.TestCase):
         session_class.return_value.client.return_value = ssm
 
         self.assertEqual(
-            sshuttle.SshuttleProcess.resolve_proxy_group(config.ProxyConfig()), "proxy-a"
+            sshuttle.SshuttleProcess.resolve_proxy_group(
+                config.ProxyConfig(mode="ssm_mapping")
+            ), "proxy-a"
         )
 
         self.assertEqual(session_class.return_value.client.call_args.args, ("ssm",))
         self.assertIs(
             session_class.return_value.client.call_args.kwargs["config"],
             sshuttle.PROXY_MAPPING_CLIENT_CONFIG,
+        )
+
+    def test_blaze_proxy_group_is_shared_and_deterministic(self) -> None:
+        self.assertEqual(
+            sshuttle.SshuttleProcess.resolve_proxy_group(config.ProxyConfig()),
+            "development-demand-proxy-01",
+        )
+        self.assertEqual(
+            sshuttle.SshuttleProcess.resolve_proxy_group(
+                config.ProxyConfig(region="ap-southeast-2")
+            ),
+            "development-demand-proxy-apse2-01",
         )
 
     @mock.patch("sshuttle.subprocess.run")
@@ -656,12 +844,35 @@ class SshuttleProcessTest(unittest.TestCase):
     def test_stops_external_proxy_before_takeover(
         self, _sleep: mock.Mock, kill: mock.Mock
     ) -> None:
-        kill.side_effect = [None, ProcessLookupError()]
+        kill.side_effect = [
+            None,
+            None,
+            None,
+            None,
+            ProcessLookupError(),
+        ]
 
         remaining = sshuttle.SshuttleProcess().stop_external_proxy((123,))
 
         self.assertEqual(remaining, ())
-        self.assertEqual(kill.call_args_list[0].args, (123, signal.SIGTERM))
+        self.assertEqual(kill.call_args_list[0].args, (123, signal.SIGCONT))
+        self.assertEqual(kill.call_args_list[1].args, (123, signal.SIGTERM))
+        self.assertEqual(kill.call_args_list[3].args, (123, signal.SIGKILL))
+
+    @mock.patch("sshuttle.subprocess.run")
+    @mock.patch("sshuttle.os.kill")
+    def test_external_proxy_stop_uses_sudo_when_process_is_root_owned(
+        self, kill: mock.Mock, run: mock.Mock
+    ) -> None:
+        kill.side_effect = PermissionError()
+
+        sshuttle.SshuttleProcess._signal((123,), signal.SIGTERM)
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "-n", "kill", "-15", "123"],
+        )
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
 
     def test_proxy_mapping_accepts_nested_and_record_shapes(self) -> None:
         self.assertEqual(
@@ -730,7 +941,9 @@ class SshuttleProcessTest(unittest.TestCase):
         )
         self.assertNotIn("SUDO_ASKPASS", run.call_args_list[0].kwargs["env"])
         self.assertEqual(run.call_args_list[1].args[0], ["sudo", "-n", "dscacheutil", "-flushcache"])
+        self.assertEqual(run.call_args_list[1].kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(run.call_args_list[3].args[0], ["sudo", "-n", "pfctl", "-f", "/etc/pf.conf"])
+        self.assertEqual(run.call_args_list[3].kwargs["stdin"], subprocess.DEVNULL)
 
     @mock.patch("sshuttle.subprocess.run")
     def test_network_prepare_accepts_a_hidden_ui_password(self, run: mock.Mock) -> None:
@@ -827,10 +1040,14 @@ class SchedulerThreadTest(unittest.TestCase):
         worker.sshuttle.is_alive = mock.Mock(return_value=False)
         worker.sshuttle.start = mock.Mock(return_value=False)
 
-        worker._check_sshuttle(100.0)
+        # The start call may itself block on AWS for a while. Its retry delay
+        # must begin after that call returns, not from the stale check time.
+        with mock.patch.object(scheduler.time, "monotonic", return_value=200.0):
+            worker._check_sshuttle(100.0)
 
         self.assertTrue(worker._proxy_attempt_done.is_set())
         worker.sshuttle.start.assert_called_once()
+        self.assertEqual(worker.next_sshuttle_check, 500.0)
 
     def test_proxy_failure_notifies_once_until_a_health_probe_recovers(self) -> None:
         project = config.ProjectConfig(
@@ -855,7 +1072,10 @@ class SchedulerThreadTest(unittest.TestCase):
         worker.sshuttle.start = mock.Mock(return_value=True)
         worker.sshuttle.check_health = mock.Mock(side_effect=((0, 1), (0, 1), (1, 1), (0, 1)))
 
-        with mock.patch.object(scheduler.LOG, "warning"):
+        with (
+            mock.patch.object(scheduler.LOG, "warning"),
+            mock.patch.object(scheduler.time, "monotonic", side_effect=(0.0, 100.0, 600.0)),
+        ):
             for now in (0.0, 100.0, 200.0, 600.0):
                 worker._check_sshuttle(now)
 
@@ -887,17 +1107,41 @@ class SchedulerThreadTest(unittest.TestCase):
         worker.sshuttle.is_alive = mock.Mock(return_value=False)
         worker.sshuttle.start = mock.Mock(return_value=True)
 
-        worker._check_sshuttle(100.0)
+        with mock.patch.object(scheduler.time, "monotonic", return_value=100.0):
+            worker._check_sshuttle(100.0)
 
         self.assertTrue(worker.manage_proxy)
         worker.sshuttle.stop_external_proxy.assert_called_once_with((123,))
         worker.sshuttle.start.assert_called_once_with(
             settings.proxy,
             prepare_network=True,
-            allow_sudo_prompt=True,
-            sudo_password_provider=password_prompt,
+            allow_sudo_prompt=False,
+            sudo_password_provider=None,
         )
         self.assertEqual(worker.next_sshuttle_check, 160.0)
+
+    def test_background_proxy_start_exits_when_sudo_password_is_required(self) -> None:
+        project = config.ProjectConfig(
+            name="fprpapi", description="", service_name="fprpapi",
+            depends_on_role=None, credential_refresh_seconds=2700,
+            credential_retry_seconds=60, restart_delay_seconds=10, shutdown_grace_seconds=15,
+        )
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=True, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor-test-sudo.lock"), default_projects=("fprpapi",),
+            default_proxy="fprpapi", roles=(), projects=(project,),
+            proxy_health_urls=("https://private/health",),
+        )
+        worker = scheduler.RefreshScheduler(settings, (), project)
+        worker.sshuttle.is_alive = mock.Mock(return_value=False)
+        worker.sshuttle.start = mock.Mock(return_value=False)
+
+        with mock.patch.object(scheduler, "network_prepare_needs_password", return_value=True):
+            result = worker.run()
+
+        self.assertEqual(result, scheduler.NEED_SUDO_PASSWORD_EXIT_CODE)
 
     def test_proxy_start_does_not_delay_connector_first_refresh(self) -> None:
         project = config.ProjectConfig(

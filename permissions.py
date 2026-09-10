@@ -12,7 +12,7 @@ import sys
 import time
 from typing import Any, Sequence
 
-from config import ProjectConfig, RoleConfig, Settings
+from config import ProjectConfig, RoleConfig, Settings, SsoPopulateConfig
 from build_artifacts import refresh_build_artifacts
 from credentials import refresh_service_credentials
 from i18n import t
@@ -39,6 +39,7 @@ class RoleRefresher:
         # keeping the interactive menu usable while it refreshes automatically.
         self.request_log_path = request_log_path
         self.last_action = t("action.check")
+        self._sso_populate_attempted = False
 
     def _run(self, command: Sequence[str], quiet: bool) -> bool:
         """Run without capturing any credential_process output or secret values."""
@@ -50,14 +51,21 @@ class RoleRefresher:
                 with self.request_log_path.open("a", encoding="utf-8") as log_file:
                     result = subprocess.run(
                         command,
+                        stdin=subprocess.DEVNULL,
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
+                        # Background refreshes must not share the menu's
+                        # terminal session. In particular, Granted may spawn
+                        # helper processes; keep them away from the foreground
+                        # TTY so Accessor can still receive q/Ctrl-C.
+                        start_new_session=True,
                         timeout=self.settings.command_timeout_seconds,
                         check=False,
                     )
             else:
                 result = subprocess.run(
                     command,
+                    stdin=subprocess.DEVNULL if quiet else None,
                     stdout=subprocess.DEVNULL if quiet else None,
                     stderr=subprocess.DEVNULL if quiet else None,
                     timeout=self.settings.command_timeout_seconds,
@@ -79,6 +87,48 @@ class RoleRefresher:
             ("aws", "sts", "get-caller-identity", "--profile", profile, "--output", "json"),
             quiet=quiet,
         )
+
+    @staticmethod
+    def _profile_exists(profile: str) -> bool:
+        """Return whether an AWS profile is configured locally.
+
+        This reads profile names only. It does not inspect or log credentials.
+        """
+        config_path = Path.home() / ".aws" / "config"
+        credentials_path = Path.home() / ".aws" / "credentials"
+        parser = configparser.RawConfigParser()
+        parser.read((config_path, credentials_path), encoding="utf-8")
+        return parser.has_section(profile) or parser.has_section(f"profile {profile}")
+
+    def _populate_sso_profiles(self, sso: SsoPopulateConfig) -> bool:
+        """Ask Granted to synchronize every SSO-visible role into AWS config."""
+        if self._sso_populate_attempted or not sso.enabled:
+            return False
+        self._sso_populate_attempted = True
+        command = (
+            "granted",
+            "sso",
+            "populate",
+            "--profile-template",
+            sso.profile_template,
+            "--sso-region",
+            sso.sso_region,
+            sso.start_url,
+        )
+        self.last_action = t("action.refresh")
+        LOG.info("Populating Granted SSO profiles")
+        return self._run(command, quiet=False)
+
+    def _ensure_profile_exists(self, profile: str) -> bool:
+        """Populate SSO profiles once when a configured profile is missing."""
+        if not self.settings.sso_populate.enabled:
+            return True
+        if self._profile_exists(profile):
+            return True
+        LOG.warning("AWS profile %s is missing; running Granted SSO populate", profile)
+        if not self._populate_sso_profiles(self.settings.sso_populate):
+            return False
+        return self._profile_exists(profile)
 
     def _aliases_available(self, role: RoleConfig) -> bool:
         return all(self._check_profile(alias) for alias in role.credential_aliases)
@@ -145,6 +195,9 @@ class RoleRefresher:
         """Check one profile, request access if needed, then check it again."""
         self.last_action = t("action.check")
         LOG.info("Refreshing role %s (%s)", role.name, role.profile)
+        if not self._ensure_profile_exists(role.profile):
+            LOG.error("AWS profile %s is not configured locally", role.profile)
+            return False
         if role.credential_source_profile is not None:
             # A long-lived consumer such as a Gradle daemon may keep using an
             # older session even while `aws sts` can still validate the alias.
@@ -180,17 +233,19 @@ class RoleRefresher:
             LOG.warning("Role %s is not currently available", role.name)
             return False
 
-        # Granted's `assume` is installed as a shell alias that sources the
-        # actual executable. Running the binary directly bypasses that alias
-        # and causes Granted to ask for alias installation again. Use the
-        # developer's interactive shell so ~/.zshenv is loaded first. The
-        # configured ``--export`` stores the approved session in the requested
-        # AWS profile: an export to this short-lived shell alone would disappear
-        # before the AWS/Boto processes that Accessor starts afterwards.
+        # Granted's `assume` is commonly installed as a shell alias/function
+        # that is initialized from the developer's shell files. Foreground
+        # one-shot commands may use an interactive shell so Granted can guide
+        # the developer. Background menu refreshes must not: `zsh -i` enables
+        # job control and can move `assumego` into the terminal foreground,
+        # which makes Accessor stop receiving input and appear impossible to
+        # quit. Non-interactive zsh still reads ~/.zshenv, where Granted's
+        # alias is normally installed, while avoiding that TTY takeover.
         shell = os.environ.get("SHELL", "/bin/zsh")
         self.last_action = t("action.refresh")
         shell_command = shlex.join((*self.settings.request_command, role.profile))
-        request_command = (shell, "-ic", shell_command)
+        shell_flag = "-c" if self.request_log_path is not None else "-ic"
+        request_command = (shell, shell_flag, shell_command)
         LOG.info("Requesting access for role %s", role.name)
         if not self._run(request_command, quiet=False):
             LOG.error("Granted could not obtain role %s", role.name)

@@ -16,7 +16,7 @@ from typing import Any, Callable, Sequence
 from config import ProjectConfig, ProxyConfig, RoleConfig, Settings
 from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, run_project_refresh
-from sshuttle import SshuttleProcess, proxy_start_error
+from sshuttle import SshuttleProcess, network_prepare_needs_password, proxy_start_error
 
 
 LOG = logging.getLogger("accessor.scheduler")
@@ -24,10 +24,15 @@ StatusReporter = Callable[[str, str, str, str], None]
 ProxyFailureNotifier = Callable[[], None]
 SCHEDULER_LOG = Path("/tmp/accessor-scheduler.log")
 LOCK_CONFLICT_EXIT_CODE = 2
+NEED_SUDO_PASSWORD_EXIT_CODE = 20
 
 
 class AccessorInstanceRunning(RuntimeError):
     """Raised when another refresh worker already owns the shared lock."""
+
+
+class SudoPasswordRequired(Exception):
+    """Raised when background recovery needs foreground sudo input."""
 
 
 class SingleInstance:
@@ -87,9 +92,9 @@ class RefreshScheduler:
         self.proxy_group = proxy_group
         self.manage_proxy = manage_proxy
         self.network_prepared = network_prepared
-        # The prompt_toolkit console implements this callback by switching the
-        # current screen to a hidden password field. Command-line mode leaves
-        # it unset, so a background job can never read from terminal stdin.
+        # Kept for API compatibility; the scheduler itself never asks for sudo
+        # input. It exits with NEED_SUDO_PASSWORD_EXIT_CODE and lets the console
+        # collect the password from the foreground UI.
         self.sudo_password_provider = sudo_password_provider
         self.proxy_failure_notifier = proxy_failure_notifier
         self._proxy_failure_notified = False
@@ -402,16 +407,28 @@ class RefreshScheduler:
             prepare_network=(
                 self.settings.prepare_network_before_proxy and not self.network_prepared
             ),
-            allow_sudo_prompt=self.sudo_password_provider is not None,
-            sudo_password_provider=self.sudo_password_provider,
+            allow_sudo_prompt=False,
+            sudo_password_provider=None,
         )
         if started:
             self.network_prepared = True
-        # SSM-backed SSH startup can take noticeably longer than a normal
-        # process restart. Do not kill a tunnel that is still connecting; wait
-        # at least one minute before its first health check.
-        self.next_sshuttle_check = now + max(60, project.restart_delay_seconds)
+        # Measure from *after* the blocking AWS/EC2 operation.  Using ``now``
+        # from before ``start`` made a 90-second failed startup immediately
+        # overdue, so the scheduler retried again a few seconds later.
+        # A failed Demand Proxy is retried on the normal five-minute probe
+        # cadence; a spawned tunnel gets its first health check after a minute.
+        delay = (
+            max(60, project.restart_delay_seconds)
+            if started
+            else self.settings.sshuttle_check_seconds
+        )
+        self.next_sshuttle_check = time.monotonic() + delay
         if not started:
+            if network_prepare_needs_password():
+                self._report_status(
+                    "job", "refresh", t("console.job_waiting_sudo"), t("action.wait")
+                )
+                raise SudoPasswordRequired()
             reason = proxy_start_error()
             proxy_status = t("scheduler.start_failed", reason=reason) if reason else t("scheduler.start_failed_generic")
             self._report_status("proxy", "demand", proxy_status, t("action.restart"))
@@ -484,6 +501,9 @@ class RefreshScheduler:
             self.lock_conflict_message = str(error)
             LOG.info("%s", error)
             return LOCK_CONFLICT_EXIT_CODE
+        except SudoPasswordRequired:
+            LOG.info("Refresh job paused until sudo password is entered")
+            return NEED_SUDO_PASSWORD_EXIT_CODE
         except RuntimeError as error:
             LOG.error("%s", error)
             self._record_fatal_error(error)
