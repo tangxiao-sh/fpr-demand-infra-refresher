@@ -55,6 +55,18 @@ The default interface language is Chinese. Use English when needed:
 Use `./accessor --language zh` to switch back. UI copy is maintained in
 [locales/en.json](locales/en.json) and [locales/zh.json](locales/zh.json).
 
+If you need the previous staging Demand Proxy flow instead of the default
+dev/blaze proxy, start with:
+
+```bash
+./accessor --previous-proxy
+```
+
+This switches the runtime configuration to `LocalStagingJumpRole@tvlk-fpr-stg`,
+the old SSM proxy mapping, and the staging health-check URLs. If a previous
+external proxy is already healthy, Accessor reuses it first; if it is unhealthy,
+Accessor takes over and restarts it.
+
 ### Console actions
 
 - `1` — Check roles, selected project credentials, and Proxy health without
@@ -84,16 +96,16 @@ Use `./accessor --language zh` to switch back. UI copy is maintained in
    proxy group; they only decide which service credentials are refreshed.
    Before starting the tunnel it asks for the terminal `sudo` password and runs
    the required DNS/PF preparation commands. The password is not echoed. The
-   old staging SSM-mapping proxy settings are kept commented in
-   `accessor.toml` for rollback/reference only.
+   previous staging SSM-mapping proxy remains available through
+   `./accessor --previous-proxy`.
 4. **Project credentials** — Each selected service credential profile is
    refreshed independently. Their normal cadence is 45 minutes; a failed
    refresh uses the configured retry interval. Updating credentials does not
    restart a healthy Proxy.
-5. **Ongoing health** — Roles are checked every 10 minutes. With the current
-   dev/blaze configuration, Proxy monitoring only checks whether Accessor's
-   own `sshuttle` process is alive; the old staging health URLs are disabled.
-   If the managed tunnel exits, Accessor restarts it.
+5. **Ongoing health** — Roles are checked every 10 minutes. Proxy monitoring
+   checks both Accessor's own `sshuttle` process and the configured dev/blaze
+   health URLs. If the managed tunnel exits or the health checks fail, Accessor
+   restarts it.
 
 The console shows cached status and recent activity while this work runs in the
 background. It does not perform AWS or network calls merely to redraw itself.
@@ -122,11 +134,13 @@ build-role refresh, run `./gradlew --stop` once, then start the build again.
 ./accessor run --project fprpapi
 ./accessor run -p fprpapi -p fprcinv --proxy fprpapi
 ./accessor run --all-projects --no-proxy
+./accessor run --all-projects --previous-proxy
 ```
 
 `run` keeps the selected credentials refreshed and optionally starts the shared
 Proxy. The current dev/blaze proxy is shared by every project, so `--proxy`
 does not change the tunnel target. `--no-proxy` refreshes credentials only.
+`--previous-proxy` uses the previous staging proxy/role flow for that run.
 
 ### One-off operations and validation
 

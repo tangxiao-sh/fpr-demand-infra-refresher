@@ -54,6 +54,7 @@ class ProjectConfig:
     shutdown_grace_seconds: int
     service_name: str = ""
     credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-dev"
+    proxy_service_name: str = ""
     ecs_cluster_name: str = ""
     ec2_cluster_tag: str | None = None
     discovery_tag: str = "service"
@@ -126,8 +127,22 @@ class Settings:
     roles: tuple[RoleConfig, ...]
     projects: tuple[ProjectConfig, ...]
     proxy: ProxyConfig = ProxyConfig()
+    previous_proxy: ProxyConfig = ProxyConfig(
+        mode="ssm_mapping",
+        profile="LocalStagingJumpRole@tvlk-fpr-stg",
+        service_name="fprpapi",
+    )
+    previous_proxy_role_name: str = "local-staging-jump"
+    previous_proxy_default_proxy: str | None = None
+    previous_proxy_health_urls: tuple[str, ...] = ()
+    previous_proxy_reuse_existing: bool = True
     build_artifacts: BuildArtifactsConfig = BuildArtifactsConfig()
     sso_populate: SsoPopulateConfig = SsoPopulateConfig()
+    # Runtime switch for developers who still need the previous staging
+    # proxy/role flow.  It is intentionally not persisted in TOML: one startup
+    # can choose legacy behavior without changing the default dev/blaze setup.
+    legacy_proxy_mode: bool = False
+    reuse_existing_proxy: bool = False
     # Private endpoints that prove sshuttle forwarding works end to end.
     proxy_health_urls: tuple[str, ...] = ()
     # A service credential operation is isolated in a worker. Its shorter
@@ -137,6 +152,22 @@ class Settings:
     @property
     def projects_by_name(self) -> dict[str, ProjectConfig]:
         return {project.name: project for project in self.projects}
+
+
+def proxy_for_project(settings: Settings, project: ProjectConfig) -> ProxyConfig:
+    """Return the active proxy config for one selected project.
+
+    The dev/blaze tunnel is shared, so it keeps the configured service name.
+    The legacy/staging SSM mapping is service-specific; use the project's
+    configured proxy service so fprmfdt, fprdapi, etc. resolve to their own
+    historical Demand Proxy group instead of a hard-coded default.
+    """
+    if settings.proxy.mode == "ssm_mapping":
+        return dataclasses.replace(
+            settings.proxy,
+            service_name=project.proxy_service_name or project.service_name,
+        )
+    return settings.proxy
 
 
 def _positive_int(value: Any, field: str, default: int) -> int:
@@ -227,6 +258,9 @@ def _read_projects(
         service_name = entry.get("service_name", name)
         if not isinstance(service_name, str) or not service_name:
             raise ConfigError(f"{field}.service_name must be a non-empty string")
+        proxy_service_name = entry.get("proxy_service_name", service_name)
+        if not isinstance(proxy_service_name, str) or not proxy_service_name:
+            raise ConfigError(f"{field}.proxy_service_name must be a non-empty string")
         credential_profile = entry.get("credential_profile", "LocalStagingJumpRole@tvlk-fpr-dev")
         if not isinstance(credential_profile, str) or not credential_profile:
             raise ConfigError(f"{field}.credential_profile must be a non-empty string")
@@ -261,6 +295,7 @@ def _read_projects(
                 name=name,
                 description=description,
                 service_name=service_name,
+                proxy_service_name=proxy_service_name,
                 credential_profile=credential_profile,
                 ecs_cluster_name=ecs_cluster_name,
                 ec2_cluster_tag=ec2_cluster_tag,
@@ -357,6 +392,33 @@ def _read_sso_populate(document: dict[str, Any]) -> SsoPopulateConfig:
     return SsoPopulateConfig(enabled=enabled, **values)
 
 
+def _read_proxy(document: dict[str, Any], section: str, default: ProxyConfig) -> ProxyConfig:
+    entry = document.get(section, {})
+    if not isinstance(entry, dict):
+        raise ConfigError(f"[{section}] must be a table")
+    proxy = ProxyConfig(
+        mode=entry.get("mode", default.mode),
+        profile=entry.get("profile", default.profile),
+        service_name=entry.get("service_name", default.service_name),
+        parameter_mapping=entry.get("parameter_mapping", default.parameter_mapping),
+        environment=entry.get("environment", default.environment),
+        group=entry.get("group", default.group),
+        region=entry.get("region", default.region),
+        exclude_cidr=entry.get("exclude_cidr", default.exclude_cidr),
+        subnets=_string_list(entry.get("subnets"), f"{section}.subnets", default.subnets),
+        ssh_user=entry.get("ssh_user", default.ssh_user),
+    )
+    if proxy.mode not in {"blaze", "ssm_mapping"}:
+        raise ConfigError(f"{section}.mode must be either 'blaze' or 'ssm_mapping'")
+    for field_name in (
+        "profile", "service_name", "parameter_mapping", "environment",
+        "group", "region", "exclude_cidr", "ssh_user",
+    ):
+        if not isinstance(getattr(proxy, field_name), str) or not getattr(proxy, field_name):
+            raise ConfigError(f"{section}.{field_name} must be a non-empty string")
+    return proxy
+
+
 def load_settings(config_path: Path) -> Settings:
     """Load TOML and validate only static values; this does not access AWS."""
     path = config_path.expanduser().resolve()
@@ -413,30 +475,25 @@ def load_settings(config_path: Path) -> Settings:
     if not isinstance(lock_file, str) or not lock_file:
         raise ConfigError("general.lock_file must be a non-empty string")
 
-    proxy_document = document.get("proxy", {})
-    if not isinstance(proxy_document, dict):
-        raise ConfigError("[proxy] must be a table")
-    proxy = ProxyConfig(
-        mode=proxy_document.get("mode", "blaze"),
-        profile=proxy_document.get("profile", "LocalStagingJumpRole@tvlk-fpr-dev"),
-        service_name=proxy_document.get("service_name", "fprpapi"),
-        parameter_mapping=proxy_document.get(
-            "parameter_mapping", "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
-        ),
-        environment=proxy_document.get("environment", "development"),
-        group=proxy_document.get("group", "demand"),
-        region=proxy_document.get("region", "ap-southeast-1"),
-        exclude_cidr=proxy_document.get("exclude_cidr", "172.17.0.0/16"),
-        subnets=_string_list(
-            proxy_document.get("subnets"), "proxy.subnets", ProxyConfig().subnets
-        ),
-        ssh_user=proxy_document.get("ssh_user", "ubuntu"),
+    proxy = _read_proxy(document, "proxy", ProxyConfig())
+    previous_proxy_default = ProxyConfig(
+        mode="ssm_mapping",
+        profile="LocalStagingJumpRole@tvlk-fpr-stg",
+        service_name="fprpapi",
     )
-    if proxy.mode not in {"blaze", "ssm_mapping"}:
-        raise ConfigError("proxy.mode must be either 'blaze' or 'ssm_mapping'")
-    for field_name in ("profile", "service_name", "parameter_mapping", "environment", "group", "region", "exclude_cidr", "ssh_user"):
-        if not isinstance(getattr(proxy, field_name), str) or not getattr(proxy, field_name):
-            raise ConfigError(f"proxy.{field_name} must be a non-empty string")
+    previous_proxy = _read_proxy(document, "previous_proxy", previous_proxy_default)
+    previous_proxy_document = document.get("previous_proxy", {})
+    previous_role_name = previous_proxy_document.get("role_name", "local-staging-jump")
+    if not isinstance(previous_role_name, str) or not previous_role_name:
+        raise ConfigError("previous_proxy.role_name must be a non-empty string")
+    previous_default_proxy = previous_proxy_document.get("default_proxy", default_proxy)
+    if previous_default_proxy is not None and (
+        not isinstance(previous_default_proxy, str) or previous_default_proxy not in project_names
+    ):
+        raise ConfigError("previous_proxy.default_proxy must refer to a configured project")
+    previous_reuse_existing = previous_proxy_document.get("reuse_existing_proxy", True)
+    if not isinstance(previous_reuse_existing, bool):
+        raise ConfigError("previous_proxy.reuse_existing_proxy must be true or false")
 
     return Settings(
         config_path=path,
@@ -464,6 +521,14 @@ def load_settings(config_path: Path) -> Settings:
         roles=roles,
         projects=projects,
         proxy=proxy,
+        previous_proxy=previous_proxy,
+        previous_proxy_role_name=previous_role_name,
+        previous_proxy_default_proxy=previous_default_proxy,
+        previous_proxy_health_urls=_string_list(
+            previous_proxy_document.get("health_urls"),
+            "previous_proxy.health_urls",
+        ),
+        previous_proxy_reuse_existing=previous_reuse_existing,
         build_artifacts=build_artifacts,
         sso_populate=sso_populate,
         proxy_health_urls=_string_list(
@@ -474,6 +539,49 @@ def load_settings(config_path: Path) -> Settings:
             "general.project_command_timeout_seconds",
             90,
         ),
+    )
+
+
+def use_previous_proxy(settings: Settings) -> Settings:
+    """Return settings for the previous staging proxy and matching jump role.
+
+    The normal configuration uses the shared dev/blaze proxy. Some services
+    still need the older staging Demand Proxy, which depends on
+    ``LocalStagingJumpRole@tvlk-fpr-stg`` and the SSM service-to-proxy mapping.
+    This helper keeps that compatibility as an explicit startup choice instead
+    of making every developer edit ``accessor.toml`` back and forth.
+    """
+    previous_role = RoleConfig(
+        name=settings.previous_proxy_role_name,
+        profile=settings.previous_proxy.profile,
+        refresh_seconds=600,
+        retry_seconds=60,
+        request_on_failure=True,
+    )
+    roles = tuple(
+        previous_role if role.name == "local-dev-jump" else role
+        for role in settings.roles
+        if role.name != previous_role.name
+    )
+    if previous_role.name not in {role.name for role in roles}:
+        roles = (*roles, previous_role)
+    projects = tuple(
+        dataclasses.replace(
+            project,
+            credential_profile=previous_role.profile,
+            depends_on_role=previous_role.name,
+        )
+        for project in settings.projects
+    )
+    return dataclasses.replace(
+        settings,
+        roles=roles,
+        projects=projects,
+        proxy=settings.previous_proxy,
+        default_proxy=settings.previous_proxy_default_proxy,
+        proxy_health_urls=settings.previous_proxy_health_urls,
+        legacy_proxy_mode=True,
+        reuse_existing_proxy=settings.previous_proxy_reuse_existing,
     )
 
 

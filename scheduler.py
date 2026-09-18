@@ -205,6 +205,9 @@ class RefreshScheduler:
             previous_project = self.proxy_project
             if self.manage_proxy and previous_project is not None:
                 self.sshuttle.stop(previous_project)
+            external_pids = self.sshuttle.find_external_proxy_pids()
+            if external_pids:
+                self.sshuttle.stop_external_proxy(external_pids)
             self.projects = tuple(projects)
             self.next_credential_refresh = {
                 project.name: 0.0 for project in self.projects
@@ -328,6 +331,7 @@ class RefreshScheduler:
         project = self.proxy_project
         if project is None or now < self.next_sshuttle_check:
             return
+        external_stopped_this_cycle = False
         if not self.manage_proxy:
             healthy, total = self.sshuttle.check_health(self.settings.proxy_health_urls)
             if healthy:
@@ -351,6 +355,7 @@ class RefreshScheduler:
                         self.next_sshuttle_check = now + project.restart_delay_seconds
                         self._complete_pending_proxy_attempt()
                         return
+                    external_stopped_this_cycle = True
                 # It is now safe to replace the failed external connection.
                 self.manage_proxy = True
             else:
@@ -385,6 +390,27 @@ class RefreshScheduler:
                     "proxy", "demand", t("proxy.managed", health=health), t("action.check")
                 )
                 self.next_sshuttle_check = now + self.settings.sshuttle_check_seconds
+                self._complete_pending_proxy_attempt()
+                return
+        external_pids = (
+            ()
+            if external_stopped_this_cycle
+            else self.sshuttle.find_external_proxy_pids()
+        )
+        if external_pids:
+            self._report_status(
+                "proxy", "demand",
+                t("scheduler.external_takeover", total=len(external_pids)),
+                t("action.takeover"),
+            )
+            remaining = self.sshuttle.stop_external_proxy(external_pids)
+            if remaining:
+                self._report_status(
+                    "proxy", "demand",
+                    t("scheduler.external_wait_exit", pids=", ".join(map(str, remaining))),
+                    t("action.restart"),
+                )
+                self.next_sshuttle_check = now + project.restart_delay_seconds
                 self._complete_pending_proxy_attempt()
                 return
         if not self._project_role_ready(project):

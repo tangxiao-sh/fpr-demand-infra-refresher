@@ -302,6 +302,12 @@ def run_project_refresh(
         "--project",
         project.name,
     )
+    if settings.legacy_proxy_mode:
+        # The console may have transformed the loaded configuration with
+        # --previous-proxy.  The child process reloads the TOML file from disk,
+        # so pass the same mode explicitly or it will fall back to the default
+        # dev/blaze credential flow and refresh the wrong AWS profile.
+        command = (*command, "--previous-proxy")
     LOG.info("Refreshing credentials for project %s", project.name)
     if dry_run:
         LOG.info("Would execute: %s", shlex.join(command))

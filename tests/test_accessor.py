@@ -80,6 +80,23 @@ class SettingsTest(unittest.TestCase):
     def test_cli_accepts_english_interface_language(self) -> None:
         self.assertEqual(cli.parse_arguments(["--language", "en"]).language, "en")
 
+    def test_cli_accepts_previous_proxy_mode(self) -> None:
+        parsed = cli.parse_arguments(["--previous-proxy"])
+
+        self.assertTrue(parsed.previous_proxy)
+
+    def test_previous_proxy_mode_uses_staging_role_and_ssm_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            previous = config.use_previous_proxy(settings)
+
+        self.assertTrue(previous.reuse_existing_proxy)
+        self.assertEqual(previous.proxy.mode, "ssm_mapping")
+        self.assertEqual(previous.proxy.profile, "LocalStagingJumpRole@tvlk-fpr-stg")
+        self.assertEqual(previous.projects_by_name["papi"].credential_profile, previous.proxy.profile)
+        self.assertEqual(previous.projects_by_name["papi"].depends_on_role, "local-staging-jump")
+        self.assertIn("https://fprcinv.fpr.stg-tvlk.cloud/healthcheck", previous.proxy_health_urls)
+
     def test_english_catalog_translates_console_status(self) -> None:
         try:
             i18n.set_language("en")
@@ -129,6 +146,29 @@ class SettingsTest(unittest.TestCase):
             {"build": False, "jump": True},
         )
 
+    @mock.patch("console.prepare_network_before_proxy", return_value=True)
+    @mock.patch.object(console.AccessorConsole, "_resolve_proxy_group", return_value="proxy-a")
+    @mock.patch("console.RefreshScheduler")
+    @mock.patch("console.RoleRefresher")
+    def test_previous_proxy_mode_reuses_external_proxy_before_sudo_prepare(
+        self,
+        refresher_class: mock.Mock,
+        scheduler_class: mock.Mock,
+        _resolve_proxy_group: mock.Mock,
+        network_prepare: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.use_previous_proxy(
+                config.load_settings(self.write_config(Path(temporary)))
+            )
+            panel = console.AccessorConsole(settings)
+            refresher_class.return_value.refresh.return_value = True
+            with mock.patch.object(panel, "_choose_projects"), mock.patch("console.threading.Thread"):
+                panel.enable_or_refresh()
+
+        network_prepare.assert_not_called()
+        self.assertFalse(scheduler_class.call_args.kwargs["manage_proxy"])
+
     @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-b")
     def test_selected_proxy_uses_shared_configured_proxy(
         self, resolve_proxy_group: mock.Mock
@@ -143,6 +183,25 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(first.name, "cinv")
         self.assertEqual(proxy.service_name, settings.proxy.service_name)
         self.assertEqual(group, "proxy-b")
+        resolve_proxy_group.assert_called_once_with(proxy)
+
+    @mock.patch("console.SshuttleProcess.resolve_proxy_group", return_value="proxy-cinv")
+    def test_previous_proxy_uses_first_selected_project_mapping(
+        self, resolve_proxy_group: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.use_previous_proxy(
+                config.load_settings(self.write_config(Path(temporary)))
+            )
+            panel = console.AccessorConsole(settings)
+            first, proxy, group = panel._selected_proxy(
+                [settings.projects_by_name["cinv"], settings.projects_by_name["papi"]]
+            )
+
+        self.assertEqual(first.name, "cinv")
+        self.assertEqual(proxy.mode, "ssm_mapping")
+        self.assertEqual(proxy.service_name, "cinv")
+        self.assertEqual(group, "proxy-cinv")
         resolve_proxy_group.assert_called_once_with(proxy)
 
     def test_project_selection_preserves_entered_order_for_proxy_choice(self) -> None:
@@ -376,6 +435,17 @@ class SettingsTest(unittest.TestCase):
                 prepare_network_before_proxy = true
                 sshuttle_check_seconds = 300
 
+                [previous_proxy]
+                mode = "ssm_mapping"
+                profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+                role_name = "local-staging-jump"
+                service_name = "papi"
+                default_proxy = "papi"
+                reuse_existing_proxy = true
+                health_urls = [
+                  "https://fprcinv.fpr.stg-tvlk.cloud/healthcheck",
+                ]
+
                 [[roles]]
                 name = "build"
                 profile = "BuildRole@example"
@@ -586,6 +656,22 @@ class CredentialAndArtifactTest(unittest.TestCase):
 
         self.assertEqual(run.call_args.kwargs["stderr"], subprocess.STDOUT)
         self.assertIn("stdout", run.call_args.kwargs)
+
+    @mock.patch("permissions.subprocess.run")
+    def test_background_project_refresh_preserves_previous_proxy_mode(self, run: mock.Mock) -> None:
+        run.return_value = subprocess.CompletedProcess([], 0)
+        settings = config.Settings(
+            config_path=Path("/tmp/accessor.toml"), auto_request=False,
+            request_command=(), command_timeout_seconds=30, post_request_delay_seconds=1,
+            prepare_network_before_proxy=False, sshuttle_check_seconds=300,
+            lock_file=Path("/tmp/accessor.lock"), default_projects=(), default_proxy=None,
+            roles=(), projects=(), legacy_proxy_mode=True,
+        )
+        project = self.project(Path("/tmp/example-proxy.py"))
+
+        self.assertTrue(permissions.run_project_refresh(settings, project))
+
+        self.assertIn("--previous-proxy", run.call_args.args[0])
 
     @mock.patch("permissions.subprocess.run")
     def test_background_role_request_writes_granted_output_to_log(self, run: mock.Mock) -> None:

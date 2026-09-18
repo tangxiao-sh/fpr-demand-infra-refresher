@@ -17,6 +17,8 @@ from config import (
     load_settings,
     select_projects,
     select_proxy_project,
+    use_previous_proxy,
+    proxy_for_project,
     validate_selection,
 )
 from i18n import SUPPORTED_LANGUAGES, set_language
@@ -51,7 +53,9 @@ def print_dry_run(
     for project in projects:
         LOG.info("Credential refresh: %s", project.name)
     LOG.info("sshuttle connector: %s", proxy_project.name if proxy_project else "disabled")
-    if proxy_project and settings.prepare_network_before_proxy:
+    if proxy_project and settings.reuse_existing_proxy:
+        LOG.info("Before sshuttle: reuse an existing healthy staging proxy when available")
+    elif proxy_project and settings.prepare_network_before_proxy:
         LOG.info("Before sshuttle: terminal sudo cache/DNS/PF preparation")
 
 
@@ -64,6 +68,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
   accessor run --project fprpapi
   accessor run -p fprpapi -p fprcinv --proxy fprpapi
   accessor run --all-projects --no-proxy
+  accessor --previous-proxy
 """,
     )
     parser.add_argument(
@@ -80,6 +85,15 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--all-projects", action="store_true", help="select every project")
     parser.add_argument("--proxy", metavar="NAME", help="selected tunnel owner")
     parser.add_argument("--no-proxy", action="store_true", help="refresh credentials only")
+    parser.add_argument(
+        "--previous-proxy",
+        "--legacy-proxy",
+        action="store_true",
+        help=(
+            "use the previous staging Demand Proxy flow: "
+            "LocalStagingJumpRole@tvlk-fpr-stg, SSM proxy mapping, and reuse an existing tunnel when healthy"
+        ),
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="TOML file")
     parser.add_argument("--no-auto-request", action="store_true", help="do not call Granted request")
     parser.add_argument("--dry-run", action="store_true", help="print work without executing it")
@@ -102,6 +116,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     set_language(args.language)
     try:
         settings = load_settings(args.config)
+        if args.previous_proxy:
+            settings = use_previous_proxy(settings)
         if args.no_auto_request:
             settings = dataclasses.replace(settings, auto_request=False)
         if args.action == "projects":
@@ -159,10 +175,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 results.append(run_project_refresh(settings, project))
         return 0 if all(role_ready.values()) and all(results) else 1
-    # The dev/blaze Demand Proxy is shared by all projects.  Project selection
-    # only controls credential refresh targets, not which tunnel to run.
-    proxy_config = settings.proxy if proxy_project is not None else None
-    return RefreshScheduler(settings, projects, proxy_project, proxy_config=proxy_config).run()
+    proxy_config = proxy_for_project(settings, proxy_project) if proxy_project is not None else None
+    return RefreshScheduler(
+        settings,
+        projects,
+        proxy_project,
+        proxy_config=proxy_config,
+        manage_proxy=not settings.reuse_existing_proxy,
+    ).run()
 
 
 if __name__ == "__main__":

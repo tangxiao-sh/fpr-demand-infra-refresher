@@ -49,6 +49,16 @@ assume --help
 使用 `./accessor --language zh` 可切回中文。界面文案分别维护在
 [locales/zh.json](locales/zh.json) 和 [locales/en.json](locales/en.json)。
 
+如果这次启动需要使用先前的 staging Demand Proxy，而不是默认 dev/blaze proxy：
+
+```bash
+./accessor --previous-proxy
+```
+
+这个参数会在本次运行中切到 `LocalStagingJumpRole@tvlk-fpr-stg`、旧 SSM proxy
+mapping 和 staging 健康检查 URL。如果已有旧外部 proxy 且健康，Accessor 会优先复用；
+如果健康检查失败，Accessor 再接管并重启。
+
 ### 控制台操作
 
 - `1`：只检查角色、所选项目凭证和 Proxy 健康状态，不会修改凭证或启动 Proxy。发现问题后会
@@ -70,11 +80,11 @@ assume --help
 3. **Demand Proxy**：Accessor 按 `[proxy]` 配置启动一个共享 dev/blaze `sshuttle` 隧道。
    所选项目不再决定 proxy 分组，只决定要刷新哪些服务凭证。启动隧道前会在当前终端请求
    `sudo` 密码，并执行 DNS/PF 网络准备命令；密码不会回显。旧 staging SSM mapping proxy
-   配置已在 `accessor.toml` 中注释保留，仅用于回滚或参考。
+   可通过 `./accessor --previous-proxy` 启用。
 4. **项目凭证**：每个所选服务的凭证独立刷新。正常刷新间隔为 45 分钟；失败后按配置的重试
    间隔执行。刷新凭证不会重启健康的 Proxy。
-5. **持续检查**：角色每 10 分钟检查一次。当前 dev/blaze 配置下，Proxy 只检查 Accessor
-   自己启动的 `sshuttle` 进程是否存活；旧 staging 健康检查 URL 已禁用。如果该隧道退出，
+5. **持续检查**：角色每 10 分钟检查一次。Proxy 会同时检查 Accessor 自己启动的
+   `sshuttle` 进程，以及配置中的 dev/blaze 健康检查 URL。如果该隧道退出或健康检查失败，
    Accessor 会自动重启。
 
 控制台只展示缓存状态与最近活动，后台刷新期间依然可操作；界面重绘本身不会触发 AWS 或网络
@@ -104,10 +114,12 @@ assume --help
 ./accessor run --project fprpapi
 ./accessor run -p fprpapi -p fprcinv --proxy fprpapi
 ./accessor run --all-projects --no-proxy
+./accessor run --all-projects --previous-proxy
 ```
 
 `run` 会保持所选凭证刷新，并可选地启动共享 Proxy。当前 dev/blaze proxy 对所有项目共享，
-所以 `--proxy` 不会改变隧道目标。`--no-proxy` 则只刷新凭证。
+所以 `--proxy` 不会改变隧道目标。`--no-proxy` 则只刷新凭证。`--previous-proxy`
+会在本次 run 中使用先前的 staging proxy/role 流程。
 
 ### 单次操作与校验
 

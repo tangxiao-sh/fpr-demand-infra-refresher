@@ -19,14 +19,13 @@ prepare_network_before_proxy = true
 # and restart the Accessor-managed tunnel only when it has exited or failed health checks.
 sshuttle_check_seconds = 300
 
-# Old staging health checks are disabled while dev/blaze proxy is active.
-# With no health URLs, Accessor only checks whether its sshuttle process is alive.
-proxy_health_urls = []
-# proxy_health_urls = [
-#   "https://fprcinv.fpr.stg-tvlk.cloud/healthcheck",
-#   "https://fprmfdt.fpr.stg-tvlk.cloud/healthcheck",
-#   "https://fprspdt.fpr.stg-tvlk.cloud/healthcheck",
-# ]
+# Health checks must match the active dev/blaze proxy environment. These URLs
+# verify that DNS and routing through the shared tunnel are both usable.
+proxy_health_urls = [
+  "https://fprcinv-blz.fpr.dev-tvlk.cloud/healthcheck",
+  "https://fprmfdt-blz.fpr.dev-tvlk.cloud/healthcheck",
+  "https://fprspdt-blz.fpr.dev-tvlk.cloud/healthcheck",
+]
 
 # Used when no --project flag is supplied. `accessor projects` shows all names.
 default_projects = ["fprpapi"]
@@ -71,11 +70,28 @@ exclude_cidr = "172.17.0.0/16"
 subnets = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
 ssh_user = "ubuntu"
 
-# Old staging/Terraform proxy path, intentionally disabled for now.
-# To restore it, set mode = "ssm_mapping" and uncomment/use these values:
-# profile = "LocalStagingJumpRole@tvlk-fpr-stg"
-# service_name = "fprpapi"
-# parameter_mapping = "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
+[previous_proxy]
+# Legacy staging/Terraform Demand Proxy. `./accessor --previous-proxy` switches
+# to this table. The actual proxy group is resolved per selected project by
+# looking up that project's `proxy_service_name` in `parameter_mapping`.
+mode = "ssm_mapping"
+profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+role_name = "local-staging-jump"
+# Fallback only; legacy mode replaces this with the first selected project's
+# `proxy_service_name` before resolving the SSM mapping.
+service_name = "fprpapi"
+parameter_mapping = "/tvlk-secret/fprprxy/fpr/demand/proxy-instance-mapping"
+default_proxy = "fprpapi"
+reuse_existing_proxy = false
+region = "ap-southeast-1"
+exclude_cidr = "172.17.0.0/16"
+subnets = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
+ssh_user = "ubuntu"
+health_urls = [
+  "https://fprcinv.fpr.stg-tvlk.cloud/healthcheck",
+  "https://fprmfdt.fpr.stg-tvlk.cloud/healthcheck",
+  "https://fprspdt.fpr.stg-tvlk.cloud/healthcheck",
+]
 
 [[roles]]
 name = "build-artifact-reader"

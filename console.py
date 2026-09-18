@@ -14,7 +14,7 @@ import time
 from typing import Callable
 from pathlib import Path
 
-from config import ProjectConfig, ProxyConfig, Settings
+from config import ProjectConfig, ProxyConfig, Settings, proxy_for_project
 from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, check_project_credentials, run_project_refresh
 from scheduler import LOCK_CONFLICT_EXIT_CODE, NEED_SUDO_PASSWORD_EXIT_CODE, RefreshScheduler
@@ -234,11 +234,12 @@ class AccessorConsole:
     ) -> tuple[ProjectConfig, ProxyConfig]:
         """Return the shared Demand Proxy configuration.
 
-        The dev/blaze proxy is one shared tunnel for every project. Project
-        selection only decides which service credentials are refreshed.
+        The dev/blaze proxy is one shared tunnel for every project. The legacy
+        SSM proxy mapping is service-specific, so the first selected project
+        selects which historical Demand Proxy group to run.
         """
         project = projects[0]
-        return project, self.settings.proxy
+        return project, proxy_for_project(self.settings, project)
 
     def _resolve_proxy_group(self, proxy: ProxyConfig) -> str:
         """Resolve one group without allowing a stalled boto call to lock the UI."""
@@ -436,6 +437,22 @@ class AccessorConsole:
             if scheduler is None:
                 return
             scheduler.update_role_ready(role_results)
+            if self.settings.proxy.mode == "ssm_mapping":
+                try:
+                    proxy_project, proxy_config, proxy_group = self._selected_proxy(projects)
+                except Exception as error:
+                    self._show_proxy_resolution_error(error)
+                    return
+                if proxy_group != scheduler.proxy_group:
+                    scheduler.switch_proxy(
+                        projects,
+                        proxy_project,
+                        proxy_config,
+                        proxy_group,
+                        network_prepared=False,
+                    )
+                    scheduler.wait_for_proxy_attempt()
+                    return
             scheduler.replace_projects(projects)
             self._update_refresh_status(
                 "proxy", "demand", t("proxy.reused", group=scheduler.proxy_group or self.settings.proxy.group), t("action.check"),
@@ -449,7 +466,7 @@ class AccessorConsole:
             return
 
         network_prepared = False
-        if self.settings.prepare_network_before_proxy:
+        if self.settings.prepare_network_before_proxy and not self.settings.reuse_existing_proxy:
             network_prepared = prepare_network_before_proxy(password_provider=password_provider)
             if not network_prepared:
                 if self._ui_active:
@@ -459,7 +476,10 @@ class AccessorConsole:
                     detail = network_prepare_error() or t("console.network_error_unknown")
                     self._read_line(f"{t('console.network_prepare_failed', detail=detail)}，{t('console.press_enter')}")
                 return
-        network_prepared = self.settings.prepare_network_before_proxy
+        network_prepared = (
+            self.settings.prepare_network_before_proxy
+            and not self.settings.reuse_existing_proxy
+        )
         # This is the only background job. It automatically renews both AWS
         # roles when their checks fail, then verifies them again. Granted output
         # is written to /tmp/accessor-role-refresh.log by the scheduler, so it
@@ -473,7 +493,7 @@ class AccessorConsole:
             proxy_config=proxy_config,
             proxy_group=proxy_group,
             status_reporter=self._update_refresh_status,
-            manage_proxy=True,
+            manage_proxy=not self.settings.reuse_existing_proxy,
             network_prepared=network_prepared,
             proxy_failure_notifier=self._notify_proxy_failure,
             initial_role_ready=role_results,
