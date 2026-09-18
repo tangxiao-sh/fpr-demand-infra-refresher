@@ -55,6 +55,14 @@ class ProjectConfig:
     service_name: str = ""
     credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-dev"
     proxy_service_name: str = ""
+    # Both deployment modes are kept on each project.  The active legacy
+    # fields above remain the compatibility view consumed by the runtime.
+    dev_credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-dev"
+    dev_depends_on_role: str | None = None
+    dev_proxy_group: str = "demand"
+    legacy_credential_profile: str = "LocalStagingJumpRole@tvlk-fpr-stg"
+    legacy_depends_on_role: str | None = "local-staging-jump"
+    legacy_proxy_group: str = "fprpapi"
     ecs_cluster_name: str = ""
     ec2_cluster_tag: str | None = None
     discovery_tag: str = "service"
@@ -162,12 +170,34 @@ def proxy_for_project(settings: Settings, project: ProjectConfig) -> ProxyConfig
     configured proxy service so fprmfdt, fprdapi, etc. resolve to their own
     historical Demand Proxy group instead of a hard-coded default.
     """
+    active_project = project_for_mode(settings, project)
     if settings.proxy.mode == "ssm_mapping":
         return dataclasses.replace(
             settings.proxy,
-            service_name=project.proxy_service_name or project.service_name,
+            service_name=active_project.proxy_service_name or active_project.service_name,
         )
-    return settings.proxy
+    return dataclasses.replace(settings.proxy, group=active_project.dev_proxy_group)
+
+
+def project_for_mode(settings: Settings, project: ProjectConfig) -> ProjectConfig:
+    """Project view selected by the current proxy/role mode.
+
+    TOML stores both modes beside the project, while the rest of Accessor can
+    continue using the small, active ``credential_profile``/
+    ``depends_on_role`` fields.
+    """
+    if settings.proxy.mode == "ssm_mapping":
+        return dataclasses.replace(
+            project,
+            credential_profile=project.legacy_credential_profile,
+            depends_on_role=project.legacy_depends_on_role,
+            proxy_service_name=project.legacy_proxy_group,
+        )
+    return dataclasses.replace(
+        project,
+        credential_profile=project.dev_credential_profile,
+        depends_on_role=project.dev_depends_on_role,
+    )
 
 
 def _positive_int(value: Any, field: str, default: int) -> int:
@@ -289,6 +319,34 @@ def _read_projects(
             raise ConfigError(
                 f"{field}.depends_on_role must refer to a configured role name"
             )
+        dev_profile = entry.get("dev_credential_profile", credential_profile)
+        legacy_profile = entry.get(
+            "legacy_credential_profile", "LocalStagingJumpRole@tvlk-fpr-stg"
+        )
+        dev_dependency = entry.get("dev_depends_on_role", dependency)
+        legacy_dependency = entry.get("legacy_depends_on_role", "local-staging-jump")
+        dev_proxy_group = entry.get("dev_proxy_group", "demand")
+        legacy_proxy_group = entry.get("legacy_proxy_group", proxy_service_name)
+        for value, name_hint in (
+            (dev_profile, "dev_credential_profile"),
+            (legacy_profile, "legacy_credential_profile"),
+            (dev_proxy_group, "dev_proxy_group"),
+            (legacy_proxy_group, "legacy_proxy_group"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ConfigError(f"{field}.{name_hint} must be a non-empty string")
+        for value, name_hint in (
+            (dev_dependency, "dev_depends_on_role"),
+            (legacy_dependency, "legacy_depends_on_role"),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ConfigError(f"{field}.{name_hint} must be a non-empty string or null")
+        for key, value in (
+            ("dev_depends_on_role", dev_dependency),
+            ("legacy_depends_on_role", legacy_dependency),
+        ):
+            if key in entry and value is not None and value not in role_names:
+                raise ConfigError(f"{field}.{key} must refer to a configured role name")
         names.add(name)
         projects.append(
             ProjectConfig(
@@ -324,6 +382,12 @@ def _read_projects(
                     f"{field}.shutdown_grace_seconds",
                     15,
                 ),
+                dev_credential_profile=dev_profile,
+                dev_depends_on_role=dev_dependency,
+                dev_proxy_group=dev_proxy_group,
+                legacy_credential_profile=legacy_profile,
+                legacy_depends_on_role=legacy_dependency,
+                legacy_proxy_group=legacy_proxy_group,
             )
         )
     return tuple(projects)
@@ -599,7 +663,7 @@ def select_projects(
         if name not in known:
             raise ConfigError(f"unknown project: {name}; run `accessor projects` to list names")
         if name not in seen:
-            selected.append(known[name])
+            selected.append(project_for_mode(settings, known[name]))
             seen.add(name)
     return tuple(selected)
 

@@ -117,13 +117,12 @@ refresh_seconds = 600
 retry_seconds = 60
 request_on_failure = true
 
-# Old staging jump role, intentionally disabled while dev/blaze proxy is active.
-# [[roles]]
-# name = "local-staging-jump"
-# profile = "LocalStagingJumpRole@tvlk-fpr-stg"
-# refresh_seconds = 600
-# retry_seconds = 60
-# request_on_failure = true
+[[roles]]
+name = "local-staging-jump"
+profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+refresh_seconds = 600
+retry_seconds = 60
+request_on_failure = true
 
 # Add one [[projects]] table per AWS service target.  These entries contain
 # metadata for AWS role discovery only; no local checkout is required.
@@ -135,35 +134,51 @@ discovery_tag = "cluster"
 discovery_value = "fprpapi-app"
 session_name_mode = "caller"
 session_name_prefix = "local_staging"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprpapi"
 
 [[projects]]
 name = "fprdapi"
 description = "fprdapi service credentials"
 service_name = "fprdapi"
 ec2_cluster_tag = "fprdapi-app"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprdapi"
 
 [[projects]]
 name = "fprcinv"
 description = "fprcinv service credentials"
 service_name = "fprcinv"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprcinv"
 
 [[projects]]
 name = "fprinv"
 description = "fprinv service credentials"
 service_name = "fprinv"
 ec2_cluster_tag = "fprinv-app"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprinv"
 
 [[projects]]
 name = "fprsapi"
@@ -173,37 +188,57 @@ discovery_tag = "service"
 discovery_value = "fprsapi"
 session_name_mode = "caller"
 session_name_prefix = "local_staging"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprpapi"
 
 [[projects]]
 name = "fprasix"
 description = "fprasix service credentials"
 service_name = "fprasix"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprasix"
 
 [[projects]]
 name = "fprdsaf"
 description = "fprdsaf service credentials"
 service_name = "fprdsaf"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprdsaf"
 
 [[projects]]
 name = "fprbpf"
 description = "fprbpf service credentials"
 service_name = "fprbpf"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprbpf"
 
 [[projects]]
 name = "fprmfdt"
 description = "fprmfdt service credentials"
-credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
-depends_on_role = "local-dev-jump"
 credential_refresh_seconds = 2700
+dev_credential_profile = "LocalStagingJumpRole@tvlk-fpr-dev"
+dev_depends_on_role = "local-dev-jump"
+dev_proxy_group = "demand"
+legacy_credential_profile = "LocalStagingJumpRole@tvlk-fpr-stg"
+legacy_depends_on_role = "local-staging-jump"
+legacy_proxy_group = "fprmfdt"

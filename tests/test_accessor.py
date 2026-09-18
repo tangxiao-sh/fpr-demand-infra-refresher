@@ -97,6 +97,20 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(previous.projects_by_name["papi"].depends_on_role, "local-staging-jump")
         self.assertIn("https://fprcinv.fpr.stg-tvlk.cloud/healthcheck", previous.proxy_health_urls)
 
+    def test_project_keeps_independent_dev_and_legacy_access_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config.load_settings(self.write_config(Path(temporary)))
+            project = settings.projects_by_name["papi"]
+            dev = config.project_for_mode(settings, project)
+            legacy = config.project_for_mode(config.use_previous_proxy(settings), project)
+
+        self.assertEqual(dev.credential_profile, "LocalStagingJumpRole@tvlk-fpr-dev")
+        self.assertEqual(dev.depends_on_role, "jump")
+        self.assertEqual(dev.proxy_service_name, "papi")
+        self.assertEqual(legacy.credential_profile, "LocalStagingJumpRole@tvlk-fpr-stg")
+        self.assertEqual(legacy.depends_on_role, "local-staging-jump")
+        self.assertEqual(legacy.proxy_service_name, "papi")
+
     def test_english_catalog_translates_console_status(self) -> None:
         try:
             i18n.set_language("en")

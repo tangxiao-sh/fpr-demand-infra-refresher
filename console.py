@@ -14,7 +14,7 @@ import time
 from typing import Callable
 from pathlib import Path
 
-from config import ProjectConfig, ProxyConfig, Settings, proxy_for_project
+from config import ProjectConfig, ProxyConfig, Settings, project_for_mode, proxy_for_project
 from i18n import t
 from permissions import ROLE_REFRESH_LOG, RoleRefresher, check_project_credentials, run_project_refresh
 from scheduler import LOCK_CONFLICT_EXIT_CODE, NEED_SUDO_PASSWORD_EXIT_CODE, RefreshScheduler
@@ -227,7 +227,11 @@ class AccessorConsole:
 
     def _selected_projects(self) -> list[ProjectConfig]:
         known = self.settings.projects_by_name
-        return [known[name] for name in self.selected_names if name in known]
+        return [
+            project_for_mode(self.settings, known[name])
+            for name in self.selected_names
+            if name in known
+        ]
 
     def _selected_proxy_config(
         self, projects: list[ProjectConfig]
